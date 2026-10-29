@@ -16,7 +16,7 @@ import re
 
 from .cache import Cache
 from .config import Settings
-from .llm.router import Judge
+from .llm.router import Judge, QuotaExhausted
 from .log import log
 from .models import Brief, Segment, Shot
 
@@ -40,13 +40,14 @@ PLAN_SCHEMA = {
         "type": "object",
         "properties": {
             "id": {"type": "integer"},
+            "subject": {"type": "string", "description": "the ONE filmable thing the clip must show"},
             "visual": {"type": "string"},
             "entities": {"type": "array", "items": {"type": "string"}},
             "youtube_queries": {"type": "array", "items": {"type": "string"}},
             "stock_queries": {"type": "array", "items": {"type": "string"}},
             "avoid": {"type": "array", "items": {"type": "string"}},
         },
-        "required": ["id", "visual", "entities", "youtube_queries", "stock_queries"]}},
+        "required": ["id", "subject", "visual", "entities", "youtube_queries", "stock_queries"]}},
         "topic": {"type": "string", "description": "the one filmable place/subject the video is about"}},
     "required": ["shots", "topic"],
 }
@@ -62,7 +63,11 @@ Return `topic`: the one filmable place or subject the whole video is about (e.g.
 shots whose narration names nothing (an intro, a closing question).
 
 Return one entry per shot in `shots` (keep id):
-- visual: one sentence describing the ideal shot (subject, setting, camera style).
+- subject: the ONE filmable thing the clip must show, 2-6 words (e.g. "Fushimi Inari torii gates",
+  "Mount Fuji", "takoyaki"). It must be named in, or clearly meant by, the narration (or be the video
+  topic when the narration names nothing). A clip showing it is usable even if the framing differs.
+- visual: one sentence describing the ideal shot of that subject (setting, camera style). This is a
+  preference, not a requirement.
 - entities: the 1-4 specific named places/objects/things that must appear, the MAIN SUBJECT FIRST
   (for a takoyaki close-up in Dotonbori: ["Takoyaki", "Dotonbori"], not ["Dotonbori", ...]).
 - youtube_queries: {nq} distinct YouTube search queries likely to surface high-quality real footage with no presenter
@@ -250,6 +255,81 @@ def _reject_impossible(shots: list[Shot], briefs: dict[int, Brief], segments: di
     return replaced
 
 
+CRITIC_SCHEMA = {
+    "type": "object",
+    "properties": {"shots": {"type": "array", "items": {
+        "type": "object",
+        "properties": {"id": {"type": "integer"}, "subject": {"type": "string"},
+                       "visual": {"type": "string"},
+                       "entities": {"type": "array", "items": {"type": "string"}}},
+        "required": ["id", "subject", "visual", "entities"]}}},
+    "required": ["shots"],
+}
+
+CRITIC_PROMPT = """You are checking B-roll briefs for a faceless YouTube video before anyone searches
+for footage. Video topic: {topic}
+
+For each shot below you get the narration and the draft brief. Fix every brief so it can be filled by
+ONE real, ordinary 5-second clip of stock-style footage:
+1. Delete any person, object, vehicle, activity or detail the narration does not mention or clearly
+   imply. Researched names of what the narration describes are fine (narration "thousands of red
+   gates" -> "Fushimi Inari"); invented extras are not (a "snow groomer" for a ski-resort line).
+2. subject: the ONE filmable thing, 2-6 words.
+3. visual: that subject plus AT MOST ONE extra condition (a time of day, OR the weather, OR one camera
+   move). Remove stacked details.
+4. entities: 1-4 names, the subject first; only things the clip must show.
+5. Shots of the same segment must keep different framings (wide, closer, aerial ...).
+If a brief is already fine, return it unchanged. Return every shot, keep the ids.
+
+{shots}
+"""
+
+
+def _critic(gem: Judge, batch: list[Shot], briefs: dict[int, Brief], topic: str, cache_key: tuple) -> int:
+    """Second pass over one planner batch that strips details the narration does not support.
+
+    The plan prompt already forbids stacked and invented details, and the model still produced
+    "a snow groomer at dawn" for a line that never mentions one, and a pagoda *and* a skyline in
+    one shot (speed test, 2026-10-29). A reviewer pass costs one call per ~40 shots. Only the
+    subject/visual/entities are taken from it; the search queries stay the planner's.
+    Returns the number of briefs it changed.
+    """
+    lines = []
+    for sh in batch:
+        b = briefs.get(sh.id)
+        if b is None:
+            continue
+        lines.append(f'[{sh.id}] segment {sh.segment} | narration: "{sh.text}" | subject: {b.subject} | '
+                     f'visual: {b.visual} | entities: {", ".join(b.entities)}')
+    if not lines:
+        return 0
+    try:
+        data = gem.json(CRITIC_PROMPT.format(topic=topic or "-", shots="\n".join(lines)), CRITIC_SCHEMA,
+                        cache_key=("plan-critic-v1",) + cache_key)
+    except QuotaExhausted:
+        raise
+    except Exception as e:
+        log.warning("brief review failed (%s); keeping the planner's briefs", e)
+        return 0
+    changed, ids = 0, {sh.id for sh in batch}
+    for d in data.get("shots") or []:
+        if not isinstance(d, dict) or d.get("id") not in ids or d["id"] not in briefs:
+            continue
+        b = briefs[d["id"]]
+        upd = {}
+        for k in ("subject", "visual"):
+            v = str(d.get(k) or "").strip()
+            if v and v != getattr(b, k):
+                upd[k] = v
+        ents = [str(e).strip() for e in d.get("entities") or [] if str(e).strip()]
+        if ents and ents != b.entities:
+            upd["entities"] = ents[:4]
+        if upd:
+            briefs[d["id"]] = b.model_copy(update=upd)
+            changed += 1
+    return changed
+
+
 def _differentiate(shots: list[Shot], briefs: dict[int, Brief]) -> list[str]:
     """Repair shots of one segment that still share a `visual`, naming the groups repaired.
 
@@ -274,30 +354,60 @@ def _differentiate(shots: list[Shot], briefs: dict[int, Brief]) -> list[str]:
     return repaired
 
 
+PLAN_CHUNK = 40     # shots per planner call
+
+
+def chunk_shots(shots: list[Shot], size: int = PLAN_CHUNK) -> list[list[Shot]]:
+    """Split the shot list into planner batches of about `size`, never splitting a segment.
+
+    One call for the whole list does not scale: a 25-minute video is ~300 shots, ~45k tokens of
+    briefs, past the output limit of the free models - the reply is truncated and every shot
+    after the cut silently gets a heuristic brief. Shots of one segment must stay together so
+    the model can vary their framing (`_differentiate` only repairs what it misses)."""
+    out: list[list[Shot]] = []
+    for sh in shots:
+        if out and len(out[-1]) >= size and out[-1][-1].segment != sh.segment:
+            out.append([])
+        if not out:
+            out.append([])
+        out[-1].append(sh)
+    return out
+
+
 def plan(segments: list[Segment], shots: list[Shot], title: str, s: Settings, cache: Cache,
          gem: Judge | None) -> dict[int, Brief]:
     """Return a brief per **shot id** (not per segment id)."""
     briefs: dict[int, Brief] = {}
     by_seg = {seg.idx: seg for seg in segments}
     topic = ""
-    if gem:
+    for batch in (chunk_shots(shots) if gem else []):
         payload = "\n".join(
             f"[{sh.id}] segment {sh.segment}, shot {sh.variant + 1} of this segment, "
-            f"{sh.duration:.1f}s: {sh.text}" for sh in shots)
+            f"{sh.duration:.1f}s: {sh.text}" for sh in batch)
         prompt = PLAN_PROMPT.format(title=title, nq=s.queries_per_segment, shots=payload,
                                     dur=f"{s.shot_target:.0f}")
+        ids = {sh.id for sh in batch}
         try:
-            data = gem.json(prompt, PLAN_SCHEMA,
-                            cache_key=("plan-shots-v2", title, payload, s.queries_per_segment))
-            topic = str(data.get("topic") or "").strip()
+            key = (title, payload, s.queries_per_segment)
+            data = gem.json(prompt, PLAN_SCHEMA, cache_key=("plan-shots-v3",) + key)
+            topic = topic or str(data.get("topic") or "").strip()
             for d in data.get("shots") or []:
-                if isinstance(d.get("id"), int):
-                    briefs[d["id"]] = Brief(visual=d.get("visual", ""), entities=d.get("entities", []),
+                if isinstance(d.get("id"), int) and d["id"] in ids:
+                    briefs[d["id"]] = Brief(subject=str(d.get("subject") or "").strip(),
+                                            visual=d.get("visual", ""), entities=d.get("entities", []),
                                             youtube_queries=d.get("youtube_queries", []),
                                             stock_queries=d.get("stock_queries", []),
                                             avoid=d.get("avoid", []))
+            if s.plan_critic:
+                n = _critic(gem, batch, briefs, topic, key)
+                if n:
+                    log.info("brief review simplified %d of %d briefs (shots %d-%d)",
+                             n, len(batch), batch[0].id, batch[-1].id)
+        except QuotaExhausted:
+            raise                 # heuristic briefs would quietly lower the whole video's quality
         except Exception as e:
-            log.warning("AI planning failed (%s); using heuristic briefs", e)
+            log.warning("AI planning failed for shots %d-%d (%s); using heuristic briefs for them",
+                        batch[0].id, batch[-1].id, e)
     topic = topic or topic_from_title(title)
     for sh in shots:
         b = briefs.get(sh.id)
@@ -314,4 +424,8 @@ def plan(segments: list[Segment], shots: list[Shot], title: str, s: Settings, ca
     if dupes:
         log.warning("planner gave shots %s the same brief; differentiated them by framing",
                     ", ".join(dupes))
+    for sh in shots:                     # heuristic and older cached briefs have no subject
+        b = briefs[sh.id]
+        if not b.subject.strip():
+            briefs[sh.id] = b.model_copy(update={"subject": primary_subject(b) or topic})
     return briefs

@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from ..llm.router import Judge
+from ..llm.router import Judge, JudgeError
 from ..log import log
 from ..models import Shot
 
@@ -26,11 +26,13 @@ VERIFY_SCHEMA = {
 
 PROMPT = """Judge this ~5 second clip as B-roll for a professional faceless YouTube video.
 Narration it accompanies: "{text}"
-Wanted shot: {visual}
-Must show: {entities}
+Must show (required): {subject}
+Ideal shot (a preference): {visual}
+Names involved: {entities}
 
 Score each 0-100 (be strict; 100 is perfect):
-relevance (does it clearly show what is wanted), quality (sharp, stable, no compression artefacts),
+relevance (does it clearly show the required subject; a different framing, time of day or camera
+move than the ideal shot costs composition/narrative points, not relevance), quality (sharp, stable, no compression artefacts),
 authenticity (looks like genuine camera footage, not AI/CGI/animation/slideshow),
 composition (framing, lighting, colour, visual appeal), recency (looks modern, not dated),
 cleanliness (no watermark/logo/subtitles/burnt-in text/channel branding), narrative (fits the narration's moment).
@@ -51,15 +53,45 @@ When it is genuinely synthetic set authenticity <= 30 even if the clip matches t
 when you are unsure, set ai_or_animated = false and explain the doubt in notes."""
 
 
-def verify_clip(gem: Judge, clip: Path, shot: Shot, cache_id: str) -> dict | None:
+# Verdict flags that hard-reject a clip whatever the AI-generated check would say.
+_OTHER_REJECTS = ("presenter_on_camera", "watermark_or_logo", "text_overlay", "black_and_white")
+
+
+def needs_ai_check(v: dict, min_relevance: float) -> bool:
+    """Is the dedicated AI check able to change this clip's outcome? Not if the verdict already
+    rejects it for something else: measured on the speed test, 14 of ~35 downloads failed verify
+    on a watermark or burnt-in text, and each still spent a second judge call on the AI question."""
+    if any(v.get(k) for k in _OTHER_REJECTS):
+        return False
+    try:
+        return float(v.get("relevance", 100)) >= min_relevance
+    except (TypeError, ValueError):
+        return True
+
+
+def verify_clip(gem: Judge, clip: Path, shot: Shot, cache_id: str,
+                min_relevance: float = 0.0) -> dict | None:
+    """The judge's verdict on a cut clip, or None if no verdict could be had for this clip.
+
+    Raises `JudgeError` when the judge chain itself is down: the caller must not mistake our
+    outage for a clip that merely could not be judged (or, worse, accept it unjudged).
+    """
     b = shot.brief
-    prompt = PROMPT.format(text=shot.text, visual=b.visual, entities=", ".join(b.entities) or "-")
+    prompt = PROMPT.format(text=shot.text, subject=b.subject or b.visual, visual=b.visual,
+                           entities=", ".join(b.entities) or "-")
     try:
         v = gem.json_video_file(clip, prompt, VERIFY_SCHEMA, fps=2.0,
-                                cache_key=("verify", cache_id, b.visual, ",".join(b.entities)))
+                                cache_key=("verify-v2", cache_id, b.subject, b.visual, ",".join(b.entities)))
+    except JudgeError as e:
+        if "frame grid" in str(e):          # this clip's problem, not an outage
+            log.warning("verify failed for %s: %s", clip.name, str(e)[:200])
+            return None
+        raise
     except Exception as e:
         log.warning("verify failed for %s: %s", clip.name, str(e)[:200])
         return None
+    if not needs_ai_check(v, min_relevance):
+        return v
 
     # `ai_or_animated` inside the 12-field verdict is unreliable in both directions: measured on
     # five known clips it called a real Tokyo skyline synthetic AND passed a generated Fuji clip.

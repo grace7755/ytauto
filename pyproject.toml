@@ -19,6 +19,10 @@ dependencies = [
   "imagehash",
   "python-dotenv",
   "faster-whisper",
+  # local CLIP pre-ranking (inspect/embed.py): CPU only, no torch
+  "onnxruntime",
+  "tokenizers",
+  "huggingface_hub",
 ]
 
 [project.optional-dependencies]

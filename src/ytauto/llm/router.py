@@ -26,17 +26,29 @@ from ..inspect.grid import extract_grid_data_url, grid_hint
 from ..log import log
 from .gemini import Gemini, GeminiError
 from .providers import DIRECT, ProviderConfig
+from .quota import Quota
 
 TIMEOUT = 150               # a judge watching a whole YouTube video can legitimately take minutes
 IMAGE_TIMEOUT = 90          # one contact sheet / frame grid: measured median ~12 s
 DOWN_SECONDS = 300          # circuit breaker: skip a failing link for 5 minutes
 QUOTA_DOWN_SECONDS = 3600   # "exceeded your current quota" is a daily cap, not a blip
 _QUOTA = re.compile(r"exceeded your current quota|quota exceeded|RESOURCE_EXHAUSTED.*per day", re.I)
+_RETRY_AFTER = re.compile(r"\[retry-after (\d+(?:\.\d+)?)s\]")
 _FENCE = re.compile(r"^\s*```(?:json)?\s*|\s*```\s*$", re.I)
 
 
 class JudgeError(RuntimeError):
     pass
+
+
+class QuotaExhausted(JudgeError):
+    """Every link that could answer is out of its daily quota. Unlike a flapping provider this
+    will not clear in minutes, so the pipeline stops starting shots (or waits for `until`, an
+    epoch time) instead of turning each remaining shot into an "unavailable" blocker."""
+
+    def __init__(self, msg: str, until: float):
+        super().__init__(msg)
+        self.until = until
 
 
 def _strip_fence(text: str) -> str:
@@ -178,6 +190,7 @@ class Judge:
         self._down: dict[str, float] = {}
         self._quota_down: dict[str, float] = {}     # links out of their daily quota
         self._direct: Gemini | None = None
+        self.quota = Quota(cache)
         self._direct_lock = threading.Lock()
         # One cap on in-flight judge calls across all shot and screening threads: provider rate
         # limits, not CPU, are what parallelism runs into (the free links return 429 even serially).
@@ -205,12 +218,29 @@ class Judge:
     def _tag(link: JudgeLink) -> str:
         return f"{link.provider}/{link.model}"
 
+    def _fit(self, need_vision: bool, need_youtube: bool) -> list[JudgeLink]:
+        return [l for l in self.chain if (l.vision or not need_vision) and (l.youtube or not need_youtube)
+                and not (l.provider == DIRECT and self._direct_failed)]
+
     def _live(self, *, need_vision: bool = False, need_youtube: bool = False) -> list[JudgeLink]:
+        """Links worth trying now. Raises `QuotaExhausted` when every fitting link is out of its
+        daily quota: those are never retried "anyway", since the provider will only say no."""
         now = time.time()
-        fit = [l for l in self.chain
-               if (l.vision or not need_vision) and (l.youtube or not need_youtube)]
+        fit = [l for l in self._fit(need_vision, need_youtube) if not self.quota.out_until(l)]
+        if not fit:
+            self._raise_quota(need_vision, need_youtube)
         live = [l for l in fit if self._down.get(self._tag(l), 0) < now]
         return live or fit        # all tripped -> try them anyway rather than fail outright
+
+    def _raise_quota(self, need_vision: bool, need_youtube: bool):
+        outs = [self.quota.out_until(l) for l in self._fit(need_vision, need_youtube)]
+        until = min([u for u in outs if u] or [time.time() + QUOTA_DOWN_SECONDS])
+        raise QuotaExhausted("every judge link is out of its daily quota until "
+                             + time.strftime("%Y-%m-%d %H:%M", time.localtime(until)), until)
+
+    def out_of_quota(self, *, need_vision: bool = False, need_youtube: bool = False) -> bool:
+        fit = self._fit(need_vision, need_youtube)
+        return bool(fit) and all(self.quota.out_until(l) for l in fit)
 
     def down_links(self) -> dict[str, float]:
         """Links currently circuit-broken -> seconds remaining (for logs and the report)."""
@@ -221,10 +251,15 @@ class Judge:
         # Measured 2026-10-29: once a free key's daily quota is spent, retrying it every 5 min for
         # the rest of the day only adds a failed round-trip to every call.
         quota = bool(_QUOTA.search(why))
-        secs = QUOTA_DOWN_SECONDS if quota else DOWN_SECONDS
-        self._down[self._tag(link)] = time.time() + secs
+        secs = DOWN_SECONDS
+        ra = _RETRY_AFTER.search(why)
+        if ra:                                  # a per-minute 429 that says when to come back
+            secs = min(DOWN_SECONDS, max(1.0, float(ra.group(1))))
         if quota:
+            # persisted, so a restarted run does not spend a request rediscovering it
+            secs = self.quota.exhaust(link) - time.time()
             self._quota_down[self._tag(link)] = time.time() + secs
+        self._down[self._tag(link)] = time.time() + secs
         log.warning("judge %s unavailable (%s); skipping it for %ds",
                     self._tag(link), why[:160], secs)
 
@@ -245,6 +280,9 @@ class Judge:
                 payload = json.loads(r.read())
         except urllib.error.HTTPError as e:
             detail = e.read()[:200].decode("utf8", "replace").replace("\n", " ")
+            ra = (e.headers.get("Retry-After") or "").strip() if e.headers else ""
+            if ra.replace(".", "", 1).isdigit():
+                detail += f" [retry-after {ra}s]"
             raise JudgeError(f"HTTP {e.code}: {detail}") from e
         except Exception as e:
             raise JudgeError(str(e)[:200]) from e
@@ -267,6 +305,15 @@ class Judge:
         if isinstance(usage.get("total_tokens"), int):
             self.tokens += usage["total_tokens"]
         return text
+
+    def _send(self, link: JudgeLink, content: list[dict], schema: dict | None,
+              timeout: float = TIMEOUT) -> str | None:
+        """`_post` behind the daily counter, the per-minute bucket and the in-flight cap.
+        None means the link's daily cap is reached and nothing was sent."""
+        if not self.quota.acquire(link):
+            return None
+        with self._slots:
+            return self._post(link, content, schema, timeout)
 
     def _direct_client(self) -> Gemini:
         with self._direct_lock:              # shots run on several threads
@@ -292,16 +339,21 @@ class Judge:
                     if link.provider == DIRECT:
                         if direct is None or self._direct_failed:
                             continue
+                        if not self.quota.acquire(link):
+                            continue
                         with self._slots:
                             return direct(self._direct_client())
-                    with self._slots:
-                        reply = self._post(link, content_for(link), schema, timeout)
+                    reply = self._send(link, content_for(link), schema, timeout)
+                    if reply is None:
+                        continue                       # daily cap reached: not a failure
                     return _extract_json(reply)
                 except (JudgeError, GeminiError, ValueError, json.JSONDecodeError) as e:
                     last = e
                     if link.provider == DIRECT and isinstance(e, GeminiError) and "API_KEY" in str(e):
                         self._direct_failed = True     # no key: never retry this link
                     self._trip(link, str(e))
+            if self.out_of_quota(need_vision=need_vision, need_youtube=need_youtube):
+                self._raise_quota(need_vision, need_youtube)
             if attempt == 0 and patience > 0 and self._recoverable(need_vision, need_youtube):
                 log.warning("every judge link failed; waiting %.0fs for one to recover", patience)
                 time.sleep(patience)
@@ -316,7 +368,7 @@ class Judge:
             if (l.vision or not need_vision) and (l.youtube or not need_youtube):
                 if l.provider == DIRECT and self._direct_failed:
                     continue
-                if self._quota_down.get(self._tag(l), 0) < now:
+                if self._quota_down.get(self._tag(l), 0) < now and not self.quota.out_until(l):
                     return True
         return False
 
@@ -440,10 +492,12 @@ class Judge:
             if link.provider == DIRECT:
                 continue
             try:
-                data = _extract_json(self._post(
-                    link, [{"type": "text", "text": prompt},
-                           {"type": "image_url", "image_url": {"url": data_url}}],
-                    self.AI_CHECK_SCHEMA))
+                reply = self._send(link, [{"type": "text", "text": prompt},
+                                          {"type": "image_url", "image_url": {"url": data_url}}],
+                                   self.AI_CHECK_SCHEMA, IMAGE_TIMEOUT)
+                if reply is None:
+                    continue
+                data = _extract_json(reply)
             except (JudgeError, ValueError, json.JSONDecodeError) as e:
                 self._trip(link, str(e))
                 continue

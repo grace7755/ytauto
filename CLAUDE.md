@@ -28,10 +28,12 @@ copy .env.example .env
 .venv\Scripts\ytauto status script.txt --title "My Video"
 .venv\Scripts\ytauto redo   script.txt --title "My Video" --shot 7
 .venv\Scripts\ytauto search "kyoto temples 4k"
+.venv\Scripts\ytauto quota                                     # judge requests used today, per link
 ```
 
 `run` is **resumable**: re-running a finished project takes ~3 s instead of minutes. Interrupt
-freely; finished shots and downloads are reused via `state.json` + the shared `cache/`.
+freely; finished shots and downloads are reused via `state.json` + the shared `cache/`. When every
+judge link is out of its daily quota, `run` pauses (exit code 3); `run --wait` sleeps until the reset.
 
 **Set `PYTHONUTF8=1` when running anything that touches YouTube metadata.** The default Windows
 encoding here is `cp1252`, so a non-ASCII video title (Japanese, emoji) raises `UnicodeEncodeError`
@@ -47,13 +49,15 @@ transcript -> planner -> select (per shot) -> assemble -> qa -> report
 
 `pipeline.py` orchestrates; `select.py` holds the real logic. Per shot, `Selector`:
 1. yt-dlp search (flat, cached) -> `youtube.details()` for metadata, nothing downloaded
-2. `screen.py` - the judge reads the video's **storyboard** (seek-bar preview sprites, one numbered
-   contact sheet via `sources/storyboard.py`) and names matching tiles; code maps tiles to times.
-   Watching the YouTube URL is the fallback (`screen_mode: url`, or a video with no storyboard)
-3. downloads only that section, `inspect/scenes.py` picks a cut-free window, cuts the clip
-4. `inspect/checks.py` local checks, then `inspect/verify.py` AI verification
-5. `benchmark.py` -> hard rejects + weighted score
-6. on failure: retry with new queries, then fall back to stock providers **per shot**
+2. `inspect/embed.py` - local CLIP ranks candidates by their best storyboard tile (no judge call)
+3. `screen.py` - the judge reads the video's **storyboard** (seek-bar preview sprites, one numbered
+   contact sheet via `sources/storyboard.py`), `screen_batch` videos per call, and names matching
+   tiles; code maps tiles to times. Watching the URL only happens with `screen_mode: storyboard`
+   (for a video with no storyboard) or `url`
+4. downloads only that section, `inspect/scenes.py` picks a cut-free window, cuts the clip
+5. `inspect/checks.py` local checks, then `inspect/verify.py` AI verification
+6. `benchmark.py` -> hard rejects + weighted score
+7. on failure: retry with new queries, then fall back to stock providers **per shot**
 
 Shots run `shot_workers` at a time and a round's candidates are screened `screen_workers` at a time;
 `judge_concurrency` caps judge calls in flight across all of it. Every run writes per-stage wall
@@ -87,6 +91,29 @@ the 4 disagreements were storyboards rejecting videos that failed after download
 more lenient on fine detail (it passed a station *exterior* for an *inside* brief), which costs a
 download, never quality: every clip still passes local checks, frame-grid verify and the dedicated
 AI check. Never take the AI-generated flag from thumbnails - that is the dedicated check's job.
+
+**Free judge quota is requests per day, so calls saved are the main lever** (`llm/quota.py`). A 25-min
+video is ~300 shots; at ~11 judge calls per shot (measured, speed test) that was ~3,300 requests against
+~1,000/day per free project. What brings it down, each measured before it was turned on:
+- batched screening (`screen_batch: 2`): one call for two contact sheets agreed with single screens
+  on `usable` 15/16 and on the best tile 12/16 (`scripts/measure_batch_screen.py`); waves are lazy, so
+  the next pair is only screened when the first produced no accepted clip
+- CLIP pre-ranking: best-tile similarity on the plain *subject* separated judge-usable videos at AUC
+  0.74 vs 0.58 for the text score (`scripts/calibrate_prerank.py`). **CLIP must not choose which tiles
+  the judge sees**: the judge's window was in CLIP's top 6 tiles only 12-20 of 43 times
+- whole-video defects (watermark, AI footage; burnt-in text after 2 strikes) are cached as `bad_video`
+  and never downloaded again; the dedicated AI check is skipped when verify already rejects the clip
+- `QuotaExhausted` (all links spent) pauses the run; it is never recorded as a reject or "unavailable"
+
+**A brief has a required `subject` and a preferred `visual`.** Screening and verify judge usability
+and relevance on the subject; the framing only ranks. The planner's stacked or invented details (a
+"snow groomer" the narration never mentions) made the judge reject good footage, so a review pass
+(`_critic`, one call per ~40-shot batch) strips them. The planner also batches (`chunk_shots`):
+one call for 300 shots would overflow a free model's output limit.
+
+**A clip is never accepted unjudged while a judge is configured.** `verify_clip` raises on chain
+exhaustion and a missing verdict is a reject; before, an outage during verify silently fell back to
+local checks only, which cannot see watermarks, burnt-in text or AI footage.
 
 **Parallel selection must reach the sequential decision.** Screens finish in any order, but the
 decision loop walks candidates in ranked order. Two shots must never cut the same footage:

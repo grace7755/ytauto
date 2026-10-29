@@ -1,0 +1,22 @@
+name: tests
+
+# The suite is offline and deterministic: no network, no API keys. ffmpeg-dependent tests run
+# because ffmpeg is installed here; they skip on machines without it.
+on:
+  push:
+  pull_request:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - run: python -m pip install -e ".[test]"
+      - run: python -m pytest -q
+        env:
+          PYTHONUTF8: "1"

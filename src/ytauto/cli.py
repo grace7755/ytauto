@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -10,6 +11,7 @@ import typer
 from . import log as logmod
 from .cache import Cache
 from .config import load_settings
+from .llm.router import QuotaExhausted, make_judge
 from .pipeline import Pipeline
 from .sources.youtube import YouTube, text_score
 
@@ -26,10 +28,22 @@ def _pipe(transcript: Path, title, vo, config, verbose) -> Pipeline:
 @app.command()
 def run(transcript: Path, title: Optional[str] = typer.Option(None, help="Project/video title (also guides search)"),
         vo: Optional[Path] = typer.Option(None, help="Voice-over audio; segments are re-timed to it"),
-        config: Optional[Path] = typer.Option(None, help="YAML overrides"), verbose: bool = False):
+        config: Optional[Path] = typer.Option(None, help="YAML overrides"), verbose: bool = False,
+        wait: bool = typer.Option(False, help="When the judge's daily quota runs out, wait for the "
+                                              "reset and continue instead of stopping")):
     """Full pipeline; resumes automatically if interrupted."""
     p = _pipe(transcript, title, vo, config, verbose)
-    data = p.run()
+    try:
+        data = p.run(wait=wait)
+    except QuotaExhausted as e:
+        typer.echo(f"\nPAUSED before selection: {e}.\nRun the same command again after the reset, "
+                   "or add --wait.")
+        raise typer.Exit(3)
+    if data.get("quota_paused_until"):
+        typer.echo(f"\nPAUSED: the judge's daily quota is spent. Finished shots are saved; run the "
+                   f"same command again after {time.strftime('%Y-%m-%d %H:%M', time.localtime(data['quota_paused_until']))}"
+                   " (or add --wait) to continue.")
+        raise typer.Exit(3)
     bad = [r for r in data["shots"] if r["status"] in ("weak", "MISSING")]
     typer.echo(f"\nvideo : {p.proj.path('output', 'final.mp4')}\nreport: {p.proj.path('report.html')}")
     typer.echo(f"sources: {data['provider_counts']}   weak/missing shots: {[r['shot'] for r in bad]}")
@@ -83,6 +97,21 @@ def status(transcript: Path, title: Optional[str] = None, config: Optional[Path]
         d = p.proj.accepted(sh.id)
         typer.echo(f"[{sh.id:>2}] {sh.start:>5.1f}-{sh.end:>5.1f}  "
                    + (f"{d.status:8} {d.provider:8} score={d.score.total if d.score else '-'} {d.title[:45]}" if d else "pending"))
+
+
+@app.command()
+def quota(config: Optional[Path] = None):
+    """Judge requests used today per link, against its configured daily cap."""
+    s = load_settings(config)
+    j = make_judge(s, Cache(s.cache_dir))
+    if j is None:
+        typer.echo("no judge configured (offline mode)")
+        return
+    for r in j.quota.status(j.chain):
+        cap = r["rpd"] if r["rpd"] is not None else "?"
+        out = (" OUT until " + time.strftime("%Y-%m-%d %H:%M", time.localtime(r["out_until"]))
+               if r["out_until"] else "")
+        typer.echo(f"{r['link']:50} {r['used_today']:>5} / {cap:<5} rpm={r['rpm'] or '-'}{out}")
 
 
 if __name__ == "__main__":

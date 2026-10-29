@@ -15,10 +15,10 @@ from .inspect.checks import run_checks
 from .inspect.probe import probe
 from .inspect.scenes import best_window
 from .inspect.verify import verify_clip
-from .llm.router import Judge, JudgeError
+from .llm.router import Judge, JudgeError, QuotaExhausted
 from .log import log
 from .models import Candidate, ClipScore, Decision, Shot
-from .screen import screen
+from .screen import screen, screen_storyboards
 from .sources.stock import Provider
 from .sources.youtube import YouTube, text_score
 from .state import Project
@@ -26,6 +26,12 @@ from .timing import stage
 
 BAD_FLAGS = {"presenter_on_camera": "creator/presenter on camera", "ai_or_animated": "AI/animated/CGI",
              "black_and_white": "black & white"}
+
+# Hard rejects that describe the whole *video*, not the window: a channel logo stays on screen for
+# the whole upload and AI footage comes from AI channels. Measured on the speed test, 14 of ~35
+# downloads failed on overlays. Burnt-in text needs two strikes - travel videos often caption only
+# some scenes with a place name, and another window may be clean.
+VIDEO_DEFECTS = {"watermark / channel logo": 1, "AI-generated / animated / CGI": 1, "burnt-in text": 2}
 
 
 class Selector:
@@ -36,6 +42,8 @@ class Selector:
         self.sid = {sh.id: i for i, sh in enumerate(shots)}
         self._lock = threading.Lock()
         self._claims: dict[str, list[tuple[float, float]]] = defaultdict(list)   # in-flight windows
+        self._index = None                       # CLIP tile index, loaded on first use
+        self._index_failed = False
 
     # ------------------------------------------------------------------
     def _decide(self, shot: Shot, c: Candidate, status: str, *, clip: Path | None = None, win=(0.0, 0.0),
@@ -58,6 +66,23 @@ class Selector:
                 n[f"{d.provider}:{d.source_id}"] += 1
                 wins.setdefault(f"{d.provider}:{d.source_id}", []).append((d.src_start, d.src_end))
         return n, wins
+
+    def _note_defects(self, c: Candidate, rejects: list[str]):
+        """Remember whole-video defects in the shared cache, so no later shot - in this project or
+        another - downloads this video again."""
+        if self.cache is None:
+            return
+        for defect, strikes in VIDEO_DEFECTS.items():
+            if not any(r.startswith(defect) for r in rejects):
+                continue
+            seen = (self.cache.get("video_strikes", c.source_id, defect) or 0) + 1
+            self.cache.set("video_strikes", seen, c.source_id, defect)
+            if seen >= strikes:
+                self.cache.set("bad_video", defect, c.source_id)
+                log.info("youtube:%s marked bad for every shot (%s)", c.source_id, defect)
+
+    def bad_video(self, c: Candidate) -> str | None:
+        return self.cache.get("bad_video", c.source_id) if self.cache is not None else None
 
     def _tried(self, shot: Shot) -> set[str]:
         return {f"{d.provider}:{d.source_id}:{d.src_start:.0f}" for d in self.proj.ledger() if d.shot == shot.id}
@@ -89,15 +114,29 @@ class Selector:
         if out_info and info:
             out_info.height = min(info.height, out_info.height)
         verdict = None
-        if self.gem and self.s.use_gemini_verify and not chk.frozen:
-            with stage("verify (AI)"):
-                verdict = verify_clip(self.gem, out, shot, f"{c.provider}:{c.source_id}:{int(win[0])}")
+        judged = self.gem and self.s.use_gemini_verify and not chk.frozen
+        if judged:
+            try:
+                with stage("verify (AI)"):
+                    verdict = verify_clip(self.gem, out, shot, f"{c.provider}:{c.source_id}:{int(win[0])}",
+                                          self.s.min_relevance)
+            except JudgeError as e:
+                if not isinstance(e, QuotaExhausted):
+                    self._decide(shot, c, "unavailable", win=win,
+                                 rejects=[f"judge chain exhausted during verify: {str(e)[:160]}"])
+                raise
         sc, rejects = evaluate(self.s, c, out_info, chk, verdict, prior)
+        if judged and verdict is None:
+            # Without a verdict nothing has checked for watermarks, burnt-in text or AI footage;
+            # local checks alone must never accept a clip while a judge is configured.
+            rejects.append("AI verify gave no verdict")
         note = f"blur={chk.blur:.0f} sat={chk.saturation:.2f} face={chk.face:.2f} overlay={chk.overlay:.2f}"
         if verdict:
             note += " | " + (verdict.get("notes") or "")[:200]
         if rejects:
             d = self._decide(shot, c, "rejected", clip=out, win=win, score=sc, rejects=rejects, notes=note)
+            if c.provider == "youtube":
+                self._note_defects(c, rejects)
             return d, out
         return self._decide(shot, c, "accepted", clip=out, win=win, score=sc, notes=note), out
 
@@ -151,6 +190,100 @@ class Selector:
             if window in self._claims[key]:
                 self._claims[key].remove(window)
 
+    # -- local pre-ranking -------------------------------------------------------
+    def _tile_index(self):
+        if self._index is None and not self._index_failed:
+            with self._lock:
+                if self._index is None and not self._index_failed:
+                    try:
+                        from .inspect.embed import Clip, TileIndex
+
+                        self._index = TileIndex(Clip(self.s.cache_dir / "models"), self.s.cache_dir)
+                    except Exception as e:          # missing package / first download offline
+                        log.warning("CLIP pre-ranking unavailable (%s); using text ranking", str(e)[:160])
+                        self._index_failed = True
+        return self._index
+
+    def _prerank(self, shot: Shot, pool: list[Candidate]) -> list[Candidate]:
+        """Order `pool` by how well the best storyboard tile matches the shot's subject (local
+        CLIP, no judge call) and keep `screen_top_k`.
+
+        Measured on 77 past candidates (scripts/calibrate_prerank.py): CLIP's best-tile similarity
+        separates judge-usable from not-usable videos with AUC 0.74, the text score only 0.58, and
+        mixing them added nothing. CLIP does NOT pick tiles well (the judge's window was in CLIP's
+        top 6 tiles only 12-20 of 43 times), so the judge still sees every tile. `filter` also drops
+        candidates more than `prerank_margin` below the best: at 0.04 that removed 12% of
+        candidates and lost 1 of 46 usable ones.
+        """
+        k = self.s.screen_top_k
+        idx = self._tile_index() if self.s.prerank != "off" else None
+        if idx is None:
+            return pool[:k]
+        with stage("storyboard fetch"):
+            sbs = self._pmap(self.yt.storyboard, pool, self.s.screen_workers)
+        has = [(c, sb) for c, sb in zip(pool, sbs) if sb is not None]
+        without = [c for c, sb in zip(pool, sbs) if sb is None]
+        if not has:
+            return pool[:k]
+        from .inspect.embed import query_text
+
+        try:
+            with stage("prerank (CLIP)"):
+                q = idx.clip.text(query_text(shot.brief))
+                sims = {c.source_id: float(idx.scores(sb, q).max()) for c, sb in has}
+        except Exception as e:
+            log.warning("CLIP pre-ranking failed (%s); using text ranking", str(e)[:160])
+            self._index_failed = True
+            return pool[:k]
+        ranked = sorted((c for c, _ in has), key=lambda c: (-round(sims[c.source_id], 3), -c.text_score))
+        if self.s.prerank == "filter":
+            top = sims[ranked[0].source_id]
+            keep = [c for c in ranked if sims[c.source_id] >= top - self.s.prerank_margin]
+            if len(keep) < len(ranked):
+                log.info("shot %d: CLIP set aside %d low-similarity candidate(s)", shot.id, len(ranked) - len(keep))
+            ranked = keep
+        for c in ranked:
+            c.screen_flags["clip"] = round(sims[c.source_id], 3)
+        # videos without a storyboard can only be URL-screened, the expensive path: last
+        return (ranked + (without if self.s.screen_mode == "storyboard" else []))[:k]
+
+    def _screen_waves(self, shot: Shot, ready: list[Candidate]):
+        """Yield (candidate, screening result) in ranked order, screening lazily.
+
+        `screen_batch` > 1: candidates are screened `screen_batch` at a time with their contact
+        sheets in ONE judge call, and the next group is only screened if this one produced no
+        accepted clip - the consumer stops iterating on an accept. Measured live on 16 past
+        verdicts: batches of 2 agreed with single screens on `usable` 15/16 and on the best tile
+        (+-1) 12/16, for half the requests. `screen_batch: 1` keeps the old behaviour: every
+        candidate of the round screened concurrently, one call each.
+        """
+        if not self.gem:
+            for c in ready:
+                yield c, None
+            return
+        size = max(1, self.s.screen_batch)
+        if size == 1 or self.s.screen_mode == "url":
+            yield from zip(ready, self._pmap(lambda c: self._screen_one(shot, c), ready, self.s.screen_workers))
+            return
+        for i in range(0, len(ready), size):
+            wave = ready[i:i + size]
+            with stage("storyboard fetch"):
+                sbs = [self.yt.storyboard(c) for c in wave]           # cached on disk by now
+            boards = [(c, sb) for c, sb in zip(wave, sbs) if sb is not None]
+            results: dict[str, object] = {}
+            if boards:
+                try:
+                    with stage("screen (storyboard)"):
+                        got = screen_storyboards(self.gem, [c for c, _ in boards], shot, [sb for _, sb in boards])
+                    results.update({c.source_id: r for (c, _), r in zip(boards, got)})
+                except JudgeError as e:
+                    results.update({c.source_id: e for c, _ in boards})
+            for c in wave:
+                if c.source_id not in results:                  # no storyboard: single path
+                    results[c.source_id] = self._screen_one(shot, c)
+            for c in wave:
+                yield c, results[c.source_id]
+
     def _screen_one(self, shot: Shot, c: Candidate):
         """Screening result for one candidate; a JudgeError is returned, not raised, so a pool of
         concurrent screens hands it back to the ordered decision loop."""
@@ -166,24 +299,28 @@ class Selector:
             # Metadata is a ~2 s network call per video, independent of the others.
             with stage("metadata"):
                 self._pmap(self.yt.details, cands[: self.s.screen_top_k * 2], self.s.screen_workers)
+            pool_n = self.s.screen_top_k * (2 if self.s.prerank != "off" and self.gem else 1)
             ready = []
             for c in cands:
                 self.yt.details(c)                       # cached unless it was past the first batch
                 if c.screen_flags.get("live") or (c.height and c.height < self.s.min_source_height):
                     continue
+                if self.bad_video(c):
+                    continue                             # known watermark / AI channel
                 ready.append(c)
-                if len(ready) >= self.s.screen_top_k:
+                if len(ready) >= pool_n:
                     break
             used_n, _ = self._used()
             ready = [c for c in ready if used_n[f"youtube:{c.source_id}"] < self.s.max_shots_per_source]
+            ready = self._prerank(shot, ready) if self.gem else ready[: self.s.screen_top_k]
             log.info("shot %d round %d: %d YouTube candidates", shot.id, rnd, len(ready))
-            # Screen concurrently, then decide in the original ranked order - so the outcome is the
-            # one a sequential run would reach, just without waiting on each call in turn.
-            screened = (self._pmap(lambda c: self._screen_one(shot, c), ready, self.s.screen_workers)
-                        if self.gem else [None] * len(ready))
-            for c, r in zip(ready, screened):
+            # Screen (in parallel or in batches), then decide in the ranked order - so the outcome
+            # is the one a sequential run would reach, just without waiting on each call in turn.
+            for c, r in self._screen_waves(shot, ready):
                 key = f"youtube:{c.source_id}"
                 prior = 40 + 0.6 * c.text_score
+                if isinstance(r, QuotaExhausted):
+                    raise r                              # paused, not failed: nothing to record
                 if isinstance(r, JudgeError):
                     # Every judge link is down. This says nothing about the footage, so it must
                     # not be logged as a reject and must not push the shot to stock - that would

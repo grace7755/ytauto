@@ -30,7 +30,7 @@ class FakeJudge:
         self.payload, self.prompt = payload, None
 
     def json(self, prompt, schema, **kw):
-        self.prompt = prompt
+        self.prompt = self.prompt or prompt      # the plan prompt; a review call may follow
         return self.payload
 
 

@@ -17,6 +17,7 @@ from __future__ import annotations
 import io
 import json
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -29,6 +30,7 @@ SHEET_COLS = 8
 MIN_TILE_W = 240        # upscale tiny 160x90 tiles a little so the judge can read them
 SPEC_MAX_AGE = 2 * 3600  # sprite URLs are signed; refetch them rather than trust an old copy
 MIN_AHEAD = 8.0         # a window must hold a ~5 s shot plus room for scene detection
+FETCH_WORKERS = 6       # sprite sheets fetched at once; measured ~7.9 s/video when sequential
 
 
 @dataclass
@@ -70,12 +72,18 @@ def _tiles(spec: dict, duration: float, timeout: float = 30) -> list[tuple[float
     # Every sheet but the last is full, so the first sheet gives the true tile interval; the last
     # sheet's `duration` is shorter and its unused slots are padding, not video.
     step = (frags[0]["duration"] or duration / max(1, len(frags))) / per
-    out: list[tuple[float, Image.Image]] = []
-    t0 = 0.0
-    for frag in frags:
+    def get(frag) -> bytes:
         r = requests.get(frag["url"], timeout=timeout)
         r.raise_for_status()
-        img = Image.open(io.BytesIO(r.content)).convert("RGB")
+        return r.content
+
+    # Sheets are independent requests; fetch them together, then slice them in time order.
+    with ThreadPoolExecutor(max(1, min(FETCH_WORKERS, len(frags)))) as ex:
+        blobs = list(ex.map(get, frags))
+    out: list[tuple[float, Image.Image]] = []
+    t0 = 0.0
+    for blob in blobs:
+        img = Image.open(io.BytesIO(blob)).convert("RGB")
         tw, th = img.width // cols, img.height // rows
         for k in range(per):
             ts = t0 + k * step

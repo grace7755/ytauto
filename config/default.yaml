@@ -22,8 +22,11 @@ rounds_per_shot: 2      # fresh-query retries on YouTube before stock fallback
 # ---- speed ------------------------------------------------------------------
 # storyboard: judge the video's seek-bar preview sheet (~12 s, ~3k tokens per candidate)
 # url:        the judge watches the whole YouTube video (~50 s, ~240k tokens per candidate)
-screen_mode: storyboard
-shot_workers: 3         # shots selected at the same time
+screen_mode: storyboard_only   # storyboard, but skip videos without one instead of URL-watching them
+screen_batch: 2         # storyboards per judge call (measured: usable agrees 15/16 with single screens)
+prerank: rank           # local CLIP orders candidates before any judge call: off | rank | filter
+prerank_margin: 0.04    # filter only: drop candidates this far below the best CLIP similarity
+shot_workers: 2         # shots selected at the same time (3 ran out of memory once on 15 GB with Chrome open)
 screen_workers: 3       # candidates screened at the same time within one shot
 judge_concurrency: 4    # max AI-judge calls in flight at once (rate limits are the real ceiling)
 judge_patience: 60      # seconds to wait for a judge link to recover before giving up a shot
@@ -43,9 +46,13 @@ fallback_order: [pexels, pixabay, coverr, mixkit]
 #   vision:  can analyse frame grids (local clip verification)
 #   youtube: can analyse a public YouTube URL without downloading it (pre-download screening)
 # A link that fails is skipped for 5 minutes. All verified working 2026-10-29.
+#   rpm / rpd: optional client-side caps (requests per minute / per day, see llm/quota.py). A link
+#   at its rpd is skipped without being called; a quota 429 marks it spent until midnight Pacific
+#   (Gemini) or for an hour (others). Leave rpd unset unless you know the real cap.
+#   `ytauto quota` shows today's use.
 judge_chain:
-  - {provider: geminiopenai, model: "models/gemini-2.5-flash-lite",   vision: true, youtube: true}
-  - {provider: geminiopenai, model: "models/gemini-flash-lite-latest", vision: true, youtube: true}
+  - {provider: geminiopenai, model: "models/gemini-2.5-flash-lite",   vision: true, youtube: true, rpm: 15}
+  - {provider: geminiopenai, model: "models/gemini-flash-lite-latest", vision: true, youtube: true, rpm: 15}
   # Reasoning model: needs a far bigger budget or it is truncated before it answers at all.
   - {provider: zai,          model: "GLM-4.6V-Flash",                 vision: true, max_tokens: 8192}
   - {provider: _direct,      model: "gemini-3-flash-preview",         vision: true, youtube: true}

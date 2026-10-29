@@ -37,6 +37,12 @@ frame grids), `youtube` (can analyse a public YouTube URL without downloading it
 A link that errors — HTTP 4xx/5xx, empty content, or a reply truncated before any answer — is **circuit-broken for
 5 minutes** and the next link takes over. Reordering providers is a config edit, not a code change.
 
+**Free-tier quota.** Free links are capped in requests per day. Each link can carry `rpm` / `rpd`; requests are
+counted locally (persisted in `cache/`, per Pacific day, since Gemini resets at midnight Pacific), so a spent link is
+skipped without being called. A "quota exceeded" 429 marks a link spent until the reset. When **every** link is
+spent, `run` stops starting shots, saves what is finished and exits with code 3 — run it again after the reset, or
+use `run --wait` to sleep until then and continue. `ytauto quota` shows today's use per link.
+
 Local clips are judged as a **tiled frame grid** (`grid_cols`×`grid_rows` @ `grid_fps`, default 6 frames) rather than
 uploaded video: every vision model accepts images, and it costs ~10× less than inline video.
 
@@ -52,8 +58,11 @@ uploaded video: every vision model accepts images, and it costs ~10× less than 
 .venv\Scripts\ytauto status script.txt --title "My Video"                                             # per-shot status
 .venv\Scripts\ytauto redo   script.txt --title "My Video" --shot 7                                    # replace one clip
 .venv\Scripts\ytauto search "kyoto temples 4k"                                                        # standalone YouTube search
+.venv\Scripts\ytauto run    script.txt --title "My Video" --wait                                      # wait out the daily quota
+.venv\Scripts\ytauto quota                                                                             # judge requests used today
 ```
-`run` is resumable: Ctrl+C at any time, run it again and finished shots/downloads are reused.
+`run` is resumable: Ctrl+C at any time, run it again and finished shots/downloads are reused. Every run writes
+per-stage wall time to `projects/<title>/logs/timings.json`.
 
 Transcript formats: `00:00-00:05 text`, `00:00–00:05: text`, `[00:05] text` (ends at next start), SRT, VTT, or JSON
 `[{"start":0,"end":5,"text":"..."}]`.
@@ -75,16 +84,21 @@ Shared across projects: `cache/` (search results, metadata, Gemini answers — r
 
 ## How selection works
 
-1. The judge (cached) turns each segment into a visual brief + queries; long segments are split into 3–6 s shots.
-2. yt-dlp searches (nothing downloaded); pre-filters by duration/blacklist/height ≥ 1080; ranks by text relevance.
-3. The judge watches the top candidates by URL (no download) and returns matching windows and flags
-   (presenter, watermark, B&W, AI).
-4. Only those windows are downloaded; PySceneDetect picks a cut-free window; the clip is cut to spec.
-5. Local checks + AI verification of a frame grid → **hard rejects** (never overridden by score) + weighted score
-   vs `min_score`.
-6. Failing shots retry with new queries, then fall back Pexels → Pixabay → Coverr → Mixkit, same benchmark.
-7. Nothing passes → closest soft-failure is used and flagged **WEAK** in the report; no footage at all → blocker.
-8. QA (spec, black/frozen detection, ledger audit, duplicate shots) re-selects failing shots automatically (max 2 loops).
+1. The judge (cached) turns each shot into a brief: a required `subject`, an ideal `visual` (a preference only),
+   entities and queries; a review pass strips details the narration does not support. Long segments are split
+   into 3–6 s shots, and long videos are planned ~40 shots per call.
+2. yt-dlp searches (nothing downloaded); pre-filters by duration/blacklist/height ≥ 1080; skips videos already
+   known to carry a watermark or AI footage.
+3. Local CLIP (CPU, `prerank`) ranks the candidates by how well their storyboard thumbnails match the subject.
+4. The judge reads the top candidates' **storyboards** (seek-bar previews, `screen_batch` videos per call) and names
+   matching thumbnails; the next candidates are only screened if those fail. Videos without a storyboard are
+   skipped (`screen_mode: storyboard_only`) or URL-watched (`storyboard`).
+5. Only those windows are downloaded; PySceneDetect picks a cut-free window; the clip is cut to spec.
+6. Local checks + AI verification of a frame grid → **hard rejects** (never overridden by score) + weighted score
+   vs `min_score`. While a judge is configured, a clip is never accepted without a verdict.
+7. Failing shots retry with new queries, then fall back Pexels → Pixabay → Coverr → Mixkit, same benchmark.
+8. Nothing passes → closest soft-failure is used and flagged **WEAK** in the report; no footage at all → blocker.
+9. QA (spec, black/frozen detection, ledger audit, duplicate shots) re-selects failing shots automatically (max 2 loops).
 
 Tune everything in `config/default.yaml` (thresholds, weights, shot length, crossfade, fallback order).
 
@@ -113,7 +127,12 @@ first and then the JSON on stdout.
 ## Tests
 
 `.venv\Scripts\python -m pytest` — offline (parsers, benchmark rules, ffmpeg assembly, QA catching black frames,
-judge chain fallback/circuit breaker/JSON parsing, frame-grid extraction). No network or API keys required.
+judge chain fallback/circuit breaker/JSON parsing, quota, frame-grid extraction). No network or API keys required.
+GitHub Actions runs the same suite on every push (`.github/workflows/tests.yml`).
+
+Measurement scripts (use cached data; the second spends a few judge calls):
+`scripts\calibrate_prerank.py` (CLIP vs past judge verdicts) · `scripts\measure_batch_screen.py` (batched vs single
+storyboard screening).
 
 ## Notes
 

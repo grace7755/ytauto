@@ -143,7 +143,7 @@ def test_parallel_round_picks_the_same_clip_as_sequential(tmp_path, monkeypatch)
     import ytauto.select as SEL
 
     def run(workers):
-        s = Settings(screen_workers=workers, rounds_per_shot=1, screen_top_k=3)
+        s = Settings(screen_workers=workers, rounds_per_shot=1, screen_top_k=3, prerank="off", screen_batch=1)
         proj = Project(tmp_path / f"p{workers}")
 
         class YT:
@@ -179,3 +179,81 @@ def test_parallel_round_picks_the_same_clip_as_sequential(tmp_path, monkeypatch)
         return picked
 
     assert run(1) == run(3) == ["a"]
+
+
+def test_batched_waves_keep_ranked_order_and_stop_after_an_accept(tmp_path, monkeypatch):
+    """Batches of 2: the first wave answers in one call; once a clip is accepted from it the
+    second wave is never screened - that is where the saving on free quota comes from."""
+    import ytauto.select as SEL
+    from ytauto.sources.storyboard import Storyboard
+
+    s = Settings(rounds_per_shot=1, screen_top_k=4, prerank="off", screen_batch=2)
+    proj = Project(tmp_path / "p")
+
+    class YT:
+        def search(self, q, n):
+            return [Candidate(provider="youtube", source_id=v, url=f"https://youtu.be/{v}",
+                              height=1080, duration=600, title=v) for v in "abcd"]
+
+        def details(self, c):
+            return c
+
+        def prefilter(self, c):
+            return None
+
+        def storyboard(self, c):
+            return Storyboard(c.source_id, b"j", [0.0, 10.0, 20.0], 10.0, 30.0)
+
+        def download_section(self, c, a, b, d):
+            return tmp_path / f"{c.source_id}.mp4"
+
+    batches = []
+
+    def fake_batch(gem, cands, shot, sbs):
+        batches.append([c.source_id for c in cands])
+        return [{"usable": c.source_id == "b", "reason": "", "presenter_on_camera": False,
+                 "black_and_white": False, "windows": [{"start": 8.0, "end": 20.0, "match": 90}]}
+                for c in cands]
+
+    monkeypatch.setattr(SEL, "screen_storyboards", fake_batch)
+    monkeypatch.setattr(SEL, "text_score", lambda c, q, e: {"a": 90, "b": 80, "c": 70, "d": 60}[c.source_id])
+    shot = Shot(id=0, segment=0, start=0, end=5, text="t",
+                brief=Brief(visual="v", entities=["e"], youtube_queries=["q"]))
+    sel = Selector(s, proj, Cache(tmp_path / "c"), YT(), object(), {}, [shot])
+    picked = []
+    monkeypatch.setattr(sel, "_try_file", lambda shot, c, path, hint, prior, off: (
+        picked.append(c.source_id),
+        (Decision(shot=0, status="accepted", provider="youtube", source_id=c.source_id, url="u"), None))[1])
+    d = sel._youtube(shot, [])
+    assert d.source_id == "b" and picked == ["b"]
+    assert batches == [["a", "b"]], "one call for the first two; the second wave is never screened"
+    assert [r.source_id for r in proj.ledger() if r.status == "rejected"] == ["a"]
+
+
+def test_batched_screen_maps_letters_back_to_the_right_videos(tmp_path):
+    from ytauto.screen import screen_storyboards
+    from ytauto.sources.storyboard import Storyboard
+
+    class J:
+        cache = Cache(tmp_path)
+
+        def json_images(self, prompt, images, schema, **kw):
+            assert len(images) == 2 and "A to B" in prompt
+            return {"videos": [{"video": "B", "usable": False, "tiles": [], "match": 0,
+                                "presenter_on_camera": False, "black_and_white": False},
+                               {"video": "A", "usable": True, "tiles": [2], "match": 88,
+                                "presenter_on_camera": False, "black_and_white": False}]}
+
+    shot = Shot(id=0, segment=0, start=0, end=5, text="t", brief=Brief(subject="s", visual="v", entities=["e"]))
+    cands = [Candidate(provider="youtube", source_id=v, url="u") for v in "xy"]
+    sbs = [Storyboard(v, b"j", [0.0, 10.0, 20.0], 10.0, 30.0) for v in "xy"]
+    r = screen_storyboards(J(), cands, shot, sbs)
+    assert r[0]["usable"] and r[0]["windows"][0]["start"] == 18.0
+    assert not r[1]["usable"]
+
+    class Never(J):
+        def json_images(self, *a, **kw):
+            raise AssertionError("both verdicts are cached per video")
+
+    again = screen_storyboards(Never(), cands, shot, sbs)
+    assert again[0]["usable"] and not again[1]["usable"]

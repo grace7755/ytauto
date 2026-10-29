@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -12,7 +13,7 @@ from .align import align_segments
 from .assemble import assemble, cut_clip, tail_for
 from .cache import Cache
 from .config import Settings
-from .llm.router import Judge, JudgeError, make_judge
+from .llm.router import Judge, JudgeError, QuotaExhausted, make_judge
 from .log import log
 from .models import Brief, Segment, Shot
 from .planner import plan
@@ -36,6 +37,7 @@ class Pipeline:
         self.providers = make_providers(s)
         self.shots: list[Shot] = []
         self.segments: list[Segment] = []
+        self.quota_until: float | None = None    # set when the judge's daily quota paused the run
 
     # ------------------------------------------------------------------
     def prepare(self):
@@ -63,11 +65,23 @@ class Pipeline:
         apart from source reuse, which `Selector` guards with a lock; blockers keep shot order."""
         sel = Selector(self.s, self.proj, self.cache, self.yt, self.gem, self.providers, self.shots)
         todo = [sh for sh in self.shots if only is None or sh.id in only]
+        self.quota_until = None
+        paused = threading.Event()
+        lock = threading.Lock()
 
         def one(sh: Shot) -> str | None:
+            if paused.is_set():
+                return f"shot {sh.id}: not started - judge quota spent; `run` again to continue"
             log.info("== shot %d/%d [%.1f-%.1fs] %s", sh.id + 1, len(self.shots), sh.start, sh.end, sh.text[:60])
             try:
                 d = sel.select(sh)
+            except QuotaExhausted as e:
+                # Every link is out of its daily quota. Starting more shots would only turn each
+                # into an "unavailable" blocker, so stop here; `run` resumes from this point.
+                paused.set()
+                with lock:
+                    self.quota_until = min(self.quota_until or e.until, e.until)
+                return f"shot {sh.id}: paused - judge quota spent ({e}); `run` again (or `run --wait`) to continue"
             except JudgeError as e:
                 # The judge chain is down, not the footage. Record it as its own blocker and keep
                 # going: later shots may succeed once a link's circuit breaker reopens, and the
@@ -101,18 +115,37 @@ class Pipeline:
         timing.write(self.proj.path("logs", "timings.json"), elapsed)
         log.info(timing.summary(elapsed))
 
-    def run(self) -> dict:
+    def run(self, wait: bool = False) -> dict:
+        """`wait`: when the judge's daily quota runs out, sleep until it resets and carry on,
+        instead of returning with the remaining shots paused."""
         t0 = time.time()
         timing.reset()
         try:
-            return self._run()
+            return self._run(wait)
         finally:
             self._finish_timing(t0)
 
-    def _run(self) -> dict:
-        self.prepare()
+    def _sleep_until(self, until: float):
+        until += 60                       # the reset is not instantaneous on the provider side
+        log.warning("judge quota spent; waiting until %s to continue",
+                    time.strftime("%Y-%m-%d %H:%M", time.localtime(until)))
+        while (left := until - time.time()) > 0:
+            time.sleep(min(left, 600))
+
+    def _run(self, wait: bool = False) -> dict:
+        while True:
+            try:
+                self.prepare()
+                break
+            except QuotaExhausted as e:
+                if not wait:
+                    raise
+                self._sleep_until(e.until)
         with timing.stage("select (wall)"):
             blockers = self.select_all()
+            while self.quota_until and wait:
+                self._sleep_until(self.quota_until)
+                blockers = self.select_all()
         qa: QAResult | None = None
         if not blockers:
             for loop in range(self.s.qa_max_loops + 1):
@@ -133,6 +166,7 @@ class Pipeline:
             if qa and not qa.passed:
                 blockers.append("QA still failing: " + "; ".join(qa.issues[:5]))
         data = build(self.proj, self.title, self.shots, qa, blockers)
+        data["quota_paused_until"] = self.quota_until
         log.info("report: %s", self.proj.path("report.html"))
         return data
 

@@ -17,7 +17,11 @@ class Segment(BaseModel):
 
 
 class Brief(BaseModel):
-    visual: str = ""                       # what the viewer should see
+    # What the clip MUST show: one filmable thing. Screening and verification judge usability and
+    # relevance on this alone; `visual` is the ideal framing and only affects ranking. Measured on
+    # the speed test, briefs stacking details made the judge reject footage of the right subject.
+    subject: str = ""
+    visual: str = ""                       # the ideal shot (framing, light, move): nice to have
     entities: list[str] = Field(default_factory=list)
     youtube_queries: list[str] = Field(default_factory=list)
     stock_queries: list[str] = Field(default_factory=list)

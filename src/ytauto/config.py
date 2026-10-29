@@ -33,6 +33,10 @@ class JudgeLink(BaseModel):
     vision: bool = False      # can analyse images / frame grids
     youtube: bool = False     # can analyse a public YouTube URL without downloading
     max_tokens: int = 2048
+    # Client-side limits (None = unknown). Free links are capped per day; counting requests
+    # ourselves skips a spent link without calling it. See llm/quota.py.
+    rpm: int | None = None
+    rpd: int | None = None
 
 
 # Verified working 2026-10-29; order = fastest and most accurate first.
@@ -68,6 +72,8 @@ class Settings(BaseModel):
     shot_max: float = 6.0
     # youtube search
     queries_per_segment: int = 4
+    # one extra planner call per ~40 shots that strips details the narration does not support
+    plan_critic: bool = True
     results_per_query: int = 15
     min_source_height: int = 1080
     min_source_duration: int = 15
@@ -78,10 +84,17 @@ class Settings(BaseModel):
     rounds_per_shot: int = 2
     # "storyboard": judge the video's seek-bar preview sheet (~12 s, ~3k tokens, any vision link);
     # "url": the judge watches the YouTube URL (~50 s, ~240k tokens, YouTube-capable links only).
-    screen_mode: Literal["storyboard", "url"] = "storyboard"
+    # "storyboard_only": as storyboard, but a video without one is skipped instead of URL-screened
+    # (the one call that costs ~240k tokens; only ~5% of candidates have no storyboard).
+    screen_mode: Literal["storyboard", "storyboard_only", "url"] = "storyboard_only"
+    # storyboards screened per judge call (1 = one call per candidate, all of a round at once)
+    screen_batch: int = 2
+    # local CLIP pre-ranking of candidates before any judge call: off | rank | filter
+    prerank: Literal["off", "rank", "filter"] = "rank"
+    prerank_margin: float = 0.04       # filter: drop candidates this far below the best similarity
     # speed: shots selected concurrently, and candidates screened concurrently within a shot.
     # Judge rate limits are the ceiling - raising these past ~4 mostly buys 429s.
-    shot_workers: int = 3
+    shot_workers: int = 2
     screen_workers: int = 3
     judge_concurrency: int = 4        # max judge calls in flight at once, across all threads
     # seconds to wait for a judge link to recover before giving a shot up as "unavailable"
