@@ -1,0 +1,145 @@
+"""End-to-end orchestration with resume: parse -> plan -> select -> assemble -> QA (loop) -> report."""
+from __future__ import annotations
+
+import json
+import shutil
+import time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+from . import timing
+from .align import align_segments
+from .assemble import assemble, cut_clip, tail_for
+from .cache import Cache
+from .config import Settings
+from .llm.router import Judge, JudgeError, make_judge
+from .log import log
+from .models import Brief, Segment, Shot
+from .planner import plan
+from .qa import QAResult, run_qa
+from .report import build
+from .select import Selector
+from .sources.stock import make_providers
+from .sources.youtube import YouTube
+from .state import Project, atomic_write, slugify
+from .transcript import load_transcript, split_shots
+
+
+class Pipeline:
+    def __init__(self, s: Settings, transcript: Path, title: str | None = None, vo: Path | None = None):
+        self.s, self.transcript, self.vo = s, transcript, vo
+        self.title = title or transcript.stem.replace("_", " ").replace("-", " ").title()
+        self.proj = Project(s.projects_dir / slugify(self.title))
+        self.cache = Cache(s.cache_dir)
+        self.gem: Judge | None = make_judge(s, self.cache)
+        self.yt = YouTube(s, self.cache)
+        self.providers = make_providers(s)
+        self.shots: list[Shot] = []
+        self.segments: list[Segment] = []
+
+    # ------------------------------------------------------------------
+    def prepare(self):
+        inp = self.proj.path("input")
+        shutil.copy2(self.transcript, inp / self.transcript.name)
+        segs = load_transcript(self.transcript)
+        if self.vo:
+            shutil.copy2(self.vo, inp / self.vo.name)
+            cached = self.proj.path("metadata", "aligned_segments.json")
+            if cached.exists():
+                segs = [Segment(**d) for d in json.loads(cached.read_text(encoding="utf-8"))]
+            else:
+                segs = align_segments(segs, self.vo)
+                atomic_write(cached, json.dumps([x.model_dump() for x in segs], indent=2))
+        self.segments = segs
+        self.shots = split_shots(segs, self.s.shot_target, self.s.shot_min, self.s.shot_max)
+        briefs = plan(segs, self.shots, self.title, self.s, self.cache, self.gem)
+        for sh in self.shots:
+            sh.brief = briefs[sh.id]
+        atomic_write(self.proj.path("metadata", "shots.json"), json.dumps([x.model_dump() for x in self.shots], indent=2))
+        log.info("%d segments -> %d shots (%.1fs total)", len(segs), len(self.shots), self.shots[-1].end)
+
+    def select_all(self, only: set[int] | None = None) -> list[str]:
+        """Select every shot (or `only` these), `shot_workers` at a time. Shots are independent
+        apart from source reuse, which `Selector` guards with a lock; blockers keep shot order."""
+        sel = Selector(self.s, self.proj, self.cache, self.yt, self.gem, self.providers, self.shots)
+        todo = [sh for sh in self.shots if only is None or sh.id in only]
+
+        def one(sh: Shot) -> str | None:
+            log.info("== shot %d/%d [%.1f-%.1fs] %s", sh.id + 1, len(self.shots), sh.start, sh.end, sh.text[:60])
+            try:
+                d = sel.select(sh)
+            except JudgeError as e:
+                # The judge chain is down, not the footage. Record it as its own blocker and keep
+                # going: later shots may succeed once a link's circuit breaker reopens, and the
+                # shot can be retried with `redo --shot N` without re-doing the finished ones.
+                return (f"shot {sh.id} ({sh.start:.0f}-{sh.end:.0f}s): judge unavailable, "
+                        f"not a footage problem; retry with `redo --shot {sh.id}` ({str(e)[:120]})")
+            if d is None:
+                return f"shot {sh.id} ({sh.start:.0f}-{sh.end:.0f}s): no footage found; manual footage needed"
+            return None
+
+        workers = max(1, min(self.s.shot_workers, len(todo)))
+        if workers == 1:
+            results = [one(sh) for sh in todo]
+        else:
+            with ThreadPoolExecutor(workers) as ex:
+                results = list(ex.map(one, todo))
+        return [b for b in results if b]
+
+    def render(self) -> Path:
+        clips = {}
+        for sh in self.shots:
+            d = self.proj.accepted(sh.id)
+            if d is None:
+                raise RuntimeError(f"shot {sh.id} has no clip")
+            clips[sh.id] = Path(d.clip_path)
+        out = self.proj.path("output", "final.mp4")
+        return assemble(self.s, self.proj, self.shots, clips, self.vo, out)
+
+    def _finish_timing(self, t0: float):
+        elapsed = time.time() - t0
+        timing.write(self.proj.path("logs", "timings.json"), elapsed)
+        log.info(timing.summary(elapsed))
+
+    def run(self) -> dict:
+        t0 = time.time()
+        timing.reset()
+        try:
+            return self._run()
+        finally:
+            self._finish_timing(t0)
+
+    def _run(self) -> dict:
+        self.prepare()
+        with timing.stage("select (wall)"):
+            blockers = self.select_all()
+        qa: QAResult | None = None
+        if not blockers:
+            for loop in range(self.s.qa_max_loops + 1):
+                with timing.stage("render"):
+                    video = self.render()
+                with timing.stage("qa"):
+                    qa = run_qa(self.s, self.proj, self.shots, video, self.shots[-1].end)
+                for i in qa.issues:
+                    log.info("QA: %s", i)
+                if qa.passed or loop == self.s.qa_max_loops or not qa.bad_shots:
+                    break
+                log.info("QA failed on shots %s -> re-selecting (loop %d)", sorted(qa.bad_shots), loop + 1)
+                for sid in qa.bad_shots:
+                    self.proj.invalidate(sid, "failed QA")
+                blockers = self.select_all(only=set(qa.bad_shots))
+                if blockers:
+                    break
+            if qa and not qa.passed:
+                blockers.append("QA still failing: " + "; ".join(qa.issues[:5]))
+        data = build(self.proj, self.title, self.shots, qa, blockers)
+        log.info("report: %s", self.proj.path("report.html"))
+        return data
+
+    def redo(self, shot_id: int) -> dict:
+        self.prepare()
+        self.proj.invalidate(shot_id, "manual redo")
+        blockers = self.select_all(only={shot_id})
+        video = self.render()
+        qa = run_qa(self.s, self.proj, self.shots, video, self.shots[-1].end)
+        return build(self.proj, self.title, self.shots, qa, blockers)

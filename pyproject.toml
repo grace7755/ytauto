@@ -1,0 +1,38 @@
+[project]
+name = "ytauto"
+version = "0.1.0"
+description = "Transcript -> faceless YouTube video, YouTube-first B-roll automation"
+requires-python = ">=3.10"
+dependencies = [
+  "yt-dlp>=2026.1.1",
+  "google-genai>=1.0",
+  "scenedetect[opencv-headless]>=0.6.4",
+  "opencv-python-headless>=4.9,<5",
+  "numpy",
+  "pydantic>=2",
+  "pydantic-settings>=2",
+  "typer>=0.12",
+  "rich",
+  "pyyaml",
+  "requests",
+  "Pillow",
+  "imagehash",
+  "python-dotenv",
+  "faster-whisper",
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[project.scripts]
+ytauto = "ytauto.cli:app"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

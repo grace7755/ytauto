@@ -1,0 +1,9 @@
+.venv/
+.env
+cache/
+projects/
+__pycache__/
+*.egg-info/
+.pytest_cache/
+.heart-config.json
+*.local.yaml
