@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -148,7 +149,14 @@ class YouTube:
 
     # ---- download ----------------------------------------------------
     def download_section(self, c: Candidate, start: float, end: float, dest_dir: Path, pad: float = 1.5) -> Path | None:
-        """Download only [start-pad, end+pad] of the video (video stream only, <=1080p). Cached on disk."""
+        """Download only [start-pad, end+pad] of the video (video stream only, <=1080p). Cached on disk.
+
+        Stream copy, no `force_keyframes_at_cuts`: that re-encoded every section at x264 defaults
+        before `cut_clip` encodes it again, a lossy extra generation. Measured on two videos: the
+        copied section's frames line up with the re-encoded one's to the frame (so a screened
+        window still maps to file time by subtracting the section start), and it is ~1 s faster.
+        Most of a section's ~12 s is the transfer itself (~2 s extraction, then streaming at
+        roughly real time)."""
         a, b = max(0.0, start - pad), end + pad
         dest_dir.mkdir(parents=True, exist_ok=True)
         out = dest_dir / f"{c.source_id}_{int(a * 10):06d}_{int(b * 10):06d}.mp4"
@@ -157,14 +165,19 @@ class YouTube:
         opts = self._opts(
             format=f"bestvideo[height<={self.s.height}][vcodec^=avc1]/bestvideo[height<={self.s.height}]/best[height<={self.s.height}]",
             download_ranges=download_range_func(None, [(a, b)]),
-            force_keyframes_at_cuts=True, outtmpl=str(out.with_suffix(".%(ext)s")),
+            outtmpl=str(out.with_suffix(".%(ext)s")),
             merge_output_format="mp4", overwrites=False)
-        try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                ydl.download([c.url])
-        except Exception as e:
-            log.warning("section download failed %s [%.1f-%.1f]: %s", c.url, a, b, str(e)[:200])
-            return None
+        for attempt in range(2):          # a section transfer can die mid-stream (seen: ffmpeg exit 3436169992)
+            try:
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    ydl.download([c.url])
+                break
+            except Exception as e:
+                log.warning("section download failed %s [%.1f-%.1f]%s: %s", c.url, a, b,
+                            " - retrying" if attempt == 0 else "", str(e)[:200])
+                if attempt:
+                    return None
+                time.sleep(2)
         if out.exists() and out.stat().st_size > 10_000:
             return out
         for f in dest_dir.glob(out.stem + ".*"):  # container other than mp4 (webm/mkv)

@@ -248,6 +248,21 @@ class Selector:
         return (ranked + (without if self.s.screen_mode == "storyboard" else []))[:k]
 
     def _screen_waves(self, shot: Shot, ready: list[Candidate]):
+        """`_screened` in ranked order, except that a usable candidate whose every proposed tile
+        shows text or a logo (`overlay_suspect`) is held back until the clean ones were tried. It
+        is a deferral, never a reject: thumbnails are too small to rule on a watermark."""
+        held = []
+        for c, r in self._screened(shot, ready):
+            if isinstance(r, dict) and r.get("usable") and r.get("overlay_suspect"):
+                held.append((c, r))
+                continue
+            yield c, r
+        if held:
+            log.info("shot %d: trying %d candidate(s) whose thumbnails all show text or a logo",
+                     shot.id, len(held))
+        yield from held
+
+    def _screened(self, shot: Shot, ready: list[Candidate]):
         """Yield (candidate, screening result) in ranked order, screening lazily.
 
         `screen_batch` > 1: candidates are screened `screen_batch` at a time with their contact
@@ -292,6 +307,42 @@ class Selector:
         except JudgeError as e:
             return e
 
+    def _ready(self, cands: list[Candidate]) -> list[Candidate]:
+        """Candidates worth screening: not live, big enough, not a known-bad video."""
+        pool_n = self.s.screen_top_k * (2 if self.s.prerank != "off" and self.gem else 1)
+        ready = []
+        for c in cands:
+            self.yt.details(c)                           # cached unless it was past the first batch
+            if c.screen_flags.get("live") or (c.height and c.height < self.s.min_source_height):
+                continue
+            if self.bad_video(c):
+                continue                                 # known watermark / AI channel
+            ready.append(c)
+            if len(ready) >= pool_n:
+                break
+        return ready
+
+    def warm(self, shot: Shot):
+        """Do a shot's judge-free round-0 work ahead of time: search, metadata, storyboards and
+        CLIP tile embeddings, all cached on disk, so that when a worker reaches the shot it goes
+        straight to the judge. No judge calls and no decisions: a failure here costs nothing, the
+        shot just does the work itself. Measured per shot in a live run: ~6 s metadata, ~5 s
+        storyboard fetch and ~18 s of CLIP, all while the judge was the only thing that could
+        not be sped up."""
+        if self.proj.accepted(shot.id):
+            return
+        k = self.s.screen_top_k
+        with stage("prefetch (background)"):
+            cands = self._youtube_candidates(shot, 0)[: k * 3]
+            self._pmap(self.yt.details, cands[: k * 2], self.s.screen_workers)
+            ready = self._ready(cands)
+            sbs = self._pmap(self.yt.storyboard, ready, self.s.screen_workers)
+            idx = self._tile_index() if self.s.prerank != "off" and self.gem else None
+            if idx is not None:
+                for sb in sbs:
+                    if sb is not None:
+                        idx.tiles(sb)
+
     def _youtube(self, shot: Shot, best: list) -> Decision | None:
         tried = self._tried(shot)
         for rnd in range(self.s.rounds_per_shot):
@@ -299,17 +350,7 @@ class Selector:
             # Metadata is a ~2 s network call per video, independent of the others.
             with stage("metadata"):
                 self._pmap(self.yt.details, cands[: self.s.screen_top_k * 2], self.s.screen_workers)
-            pool_n = self.s.screen_top_k * (2 if self.s.prerank != "off" and self.gem else 1)
-            ready = []
-            for c in cands:
-                self.yt.details(c)                       # cached unless it was past the first batch
-                if c.screen_flags.get("live") or (c.height and c.height < self.s.min_source_height):
-                    continue
-                if self.bad_video(c):
-                    continue                             # known watermark / AI channel
-                ready.append(c)
-                if len(ready) >= pool_n:
-                    break
+            ready = self._ready(cands)
             used_n, _ = self._used()
             ready = [c for c in ready if used_n[f"youtube:{c.source_id}"] < self.s.max_shots_per_source]
             ready = self._prerank(shot, ready) if self.gem else ready[: self.s.screen_top_k]

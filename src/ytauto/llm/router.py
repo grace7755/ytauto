@@ -31,9 +31,16 @@ from .quota import Quota
 TIMEOUT = 150               # a judge watching a whole YouTube video can legitimately take minutes
 IMAGE_TIMEOUT = 90          # one contact sheet / frame grid: measured median ~12 s
 DOWN_SECONDS = 300          # circuit breaker: skip a failing link for 5 minutes
+OVERLOAD_SECONDS = 60       # Google's 503 "high demand" / 504 clear fast; measured: dozens per run on 2026-10-29
+_OVERLOADED = re.compile(r"\b(?:503|504)\b|UNAVAILABLE|DEADLINE_EXCEEDED")
 QUOTA_DOWN_SECONDS = 3600   # "exceeded your current quota" is a daily cap, not a blip
 _QUOTA = re.compile(r"exceeded your current quota|quota exceeded|RESOURCE_EXHAUSTED.*per day", re.I)
 _RETRY_AFTER = re.compile(r"\[retry-after (\d+(?:\.\d+)?)s\]")
+# Gemini's own 429 body names the quota that ran out and when to retry. A *per-minute* quota says
+# "exceeded your current quota" too, and must not take the link out for the rest of the day.
+_PER_MINUTE = re.compile(r"per ?minute", re.I)
+_PER_DAY = re.compile(r"per ?day", re.I)
+_RETRY_DELAY = re.compile(r"retryDelay['\"]?\s*[:=]\s*['\"]?(\d+(?:\.\d+)?)s")
 _FENCE = re.compile(r"^\s*```(?:json)?\s*|\s*```\s*$", re.I)
 
 
@@ -250,11 +257,13 @@ class Judge:
     def _trip(self, link: JudgeLink, why: str):
         # Measured 2026-10-29: once a free key's daily quota is spent, retrying it every 5 min for
         # the rest of the day only adds a failed round-trip to every call.
-        quota = bool(_QUOTA.search(why))
+        quota = bool(_QUOTA.search(why)) and bool(_PER_DAY.search(why) or not _PER_MINUTE.search(why))
         secs = DOWN_SECONDS
-        ra = _RETRY_AFTER.search(why)
+        ra = _RETRY_AFTER.search(why) or _RETRY_DELAY.search(why)
         if ra:                                  # a per-minute 429 that says when to come back
             secs = min(DOWN_SECONDS, max(1.0, float(ra.group(1))))
+        elif _OVERLOADED.search(why[:120]):
+            secs = OVERLOAD_SECONDS               # a demand spike: back off briefly, not for 5 minutes
         if quota:
             # persisted, so a restarted run does not spend a request rediscovering it
             secs = self.quota.exhaust(link) - time.time()
@@ -318,7 +327,7 @@ class Judge:
     def _direct_client(self) -> Gemini:
         with self._direct_lock:              # shots run on several threads
             if self._direct is None:
-                self._direct = Gemini(self.s, self.cache)
+                self._direct = Gemini(self.s, self.cache, fallback=False)
             return self._direct
 
     # -- core dispatch -------------------------------------------------------
@@ -342,7 +351,9 @@ class Judge:
                         if not self.quota.acquire(link):
                             continue
                         with self._slots:
-                            return direct(self._direct_client())
+                            data = direct(self._direct_client(), link.model)
+                        self.calls += 1
+                        return data
                     reply = self._send(link, content_for(link), schema, timeout)
                     if reply is None:
                         continue                       # daily cap reached: not a failure
@@ -381,7 +392,7 @@ class Judge:
                 return hit
         full = prompt + _schema_hint(schema)
         data = self._run(lambda l: [{"type": "text", "text": full}], schema,
-                         direct=lambda g: g.json(prompt, schema, model=model))
+                         direct=lambda g, m: g.json(prompt, schema, model=m))
         if cache_key is not None:
             self.cache.set("judge", data, *cache_key)
         return data
@@ -404,8 +415,8 @@ class Judge:
                     {"type": "image_url", "image_url": {"url": url}}]
 
         data = self._run(content, schema, need_vision=True, need_youtube=True,
-                         direct=lambda g: g.json_youtube(url, prompt, schema, start=start,
-                                                         end=end, fps=fps))
+                         direct=lambda g, m: g.json_youtube(url, prompt, schema, start=start,
+                                                            end=end, fps=fps, model=m))
         if cache_key is not None:
             self.cache.set("judge", data, *cache_key)
         return data
@@ -425,7 +436,7 @@ class Judge:
                 {"type": "image_url", "image_url": {"url": u}} for u in urls]
 
         data = self._run(content, schema, need_vision=True, timeout=IMAGE_TIMEOUT,
-                         direct=lambda g: g.json_images(prompt, images, schema))
+                         direct=lambda g, m: g.json_images(prompt, images, schema, model=m))
         if cache_key is not None:
             self.cache.set("judge", data, *cache_key)
         return data
@@ -448,7 +459,8 @@ class Judge:
                     {"type": "image_url", "image_url": {"url": data_url}}]
 
         data = self._run(content, schema, need_vision=True,
-                         direct=lambda g: g.json_video_file(Path(path), prompt, schema, fps=fps))
+                         direct=lambda g, m: g.json_video_file(Path(path), prompt, schema, fps=fps,
+                                                               model=m))
         if cache_key is not None:
             self.cache.set("judge", data, *cache_key)
         return data
@@ -485,20 +497,27 @@ class Judge:
         data_url = extract_grid_data_url(Path(clip), cols=cols, rows=rows, fps=self.s.grid_fps)
         if data_url is None:
             return None
-        prompt = (self.AI_CHECK_PROMPT.format(n=cols * rows)
-                  + _schema_hint(self.AI_CHECK_SCHEMA))
+        question = self.AI_CHECK_PROMPT.format(n=cols * rows)
+        prompt = question + _schema_hint(self.AI_CHECK_SCHEMA)
 
         for link in self._live(need_vision=True):
-            if link.provider == DIRECT:
-                continue
             try:
-                reply = self._send(link, [{"type": "text", "text": prompt},
-                                          {"type": "image_url", "image_url": {"url": data_url}}],
-                                   self.AI_CHECK_SCHEMA, IMAGE_TIMEOUT)
-                if reply is None:
-                    continue
-                data = _extract_json(reply)
-            except (JudgeError, ValueError, json.JSONDecodeError) as e:
+                if link.provider == DIRECT:
+                    if self._direct_failed or not self.quota.acquire(link):
+                        continue
+                    jpeg = base64.b64decode(data_url.split(",", 1)[1])
+                    with self._slots:
+                        data = self._direct_client().json_images(question, [jpeg], self.AI_CHECK_SCHEMA,
+                                                                 model=link.model)
+                    self.calls += 1
+                else:
+                    reply = self._send(link, [{"type": "text", "text": prompt},
+                                              {"type": "image_url", "image_url": {"url": data_url}}],
+                                       self.AI_CHECK_SCHEMA, IMAGE_TIMEOUT)
+                    if reply is None:
+                        continue
+                    data = _extract_json(reply)
+            except (JudgeError, GeminiError, ValueError, json.JSONDecodeError) as e:
                 self._trip(link, str(e))
                 continue
             if cache_key is not None:

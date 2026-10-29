@@ -106,7 +106,7 @@ def test_no_storyboard_returns_none(tmp_path):
 
 def test_window_spans_the_tile_and_stays_in_the_video():
     sb = SB.Storyboard("v", b"", [0.0, 10.0, 20.0], 10.0, 25.0)
-    assert sb.window(1) == (8.0, 20.0)
+    assert sb.window(1) == (8.0, 16.0), "8 s: a 5 s shot plus room for scene detection, no more to download"
     assert sb.window(2) == (18.0, 25.0), "clipped to the end of the video"
     assert sb.window(0)[0] == 0.0
     assert sb.window(7) is None
@@ -190,3 +190,64 @@ def test_url_mode_never_touches_storyboards():
             return {"usable": False, "windows": []}
 
     screen(J(), CAND, SHOT, yt=YT(), mode="url")
+
+
+def test_overlay_tiles_reorder_but_never_reject():
+    """Thumbnails are too small to rule on a watermark: a flagged tile is only tried last."""
+    j = _Judge({"usable": True, "tiles": [3, 1, 2], "overlay_tiles": [3], "match": 90,
+                "presenter_on_camera": False, "black_and_white": False})
+    r = screen_storyboard(j, CAND, SHOT, SBOARD)
+    assert r["usable"] is True and r["overlay_suspect"] is False
+    assert [w["start"] for w in r["windows"]] == [8.0, 18.0, 28.0], "clean tiles first, judge order kept"
+    assert [w["overlay"] for w in r["windows"]] == [False, False, True]
+
+
+def test_every_tile_flagged_makes_the_video_a_suspect_not_a_reject():
+    j = _Judge({"usable": True, "tiles": [1, 2], "overlay_tiles": [1, "2"], "match": 80,
+                "presenter_on_camera": False, "black_and_white": False})
+    r = screen_storyboard(j, CAND, SHOT, SBOARD)
+    assert r["usable"] is True and r["overlay_suspect"] is True and len(r["windows"]) == 2
+
+
+def test_verdicts_cached_before_overlay_tiles_existed_still_work():
+    j = _Judge({"usable": True, "tiles": [1], "match": 80,
+                "presenter_on_camera": False, "black_and_white": False})
+    r = screen_storyboard(j, CAND, SHOT, SBOARD)
+    assert r["overlay_suspect"] is False and r["windows"][0]["overlay"] is False
+
+
+def test_a_failed_section_download_is_retried_once(tmp_path, monkeypatch):
+    from ytauto.config import Settings
+    from ytauto.sources import youtube as Y
+
+    attempts = []
+
+    class DL:
+        def __init__(self, opts):
+            self.opts = opts
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def download(self, urls):
+            attempts.append(1)
+            if len(attempts) == 1:
+                raise RuntimeError("ffmpeg exited with code 3436169992")
+            out = tmp_path / "v_000000_000100.mp4"
+            out.write_bytes(b"x" * 20_000)
+
+    monkeypatch.setattr(Y.yt_dlp, "YoutubeDL", DL)
+    monkeypatch.setattr(Y.time, "sleep", lambda s: None)
+    yt = Y.YouTube.__new__(Y.YouTube)
+    yt.s = Settings()
+    c = Candidate(provider="youtube", source_id="v", url="https://youtu.be/v", duration=60)
+    got = yt.download_section(c, 1.5, 8.5, tmp_path, pad=1.5)
+    assert got is not None and len(attempts) == 2
+
+    attempts.clear()
+    (tmp_path / "v_000000_000100.mp4").unlink()
+    monkeypatch.setattr(DL, "download", lambda self, urls: (attempts.append(1), 1 / 0)[1])
+    assert yt.download_section(c, 1.5, 8.5, tmp_path, pad=1.5) is None and len(attempts) == 2, "gives up after one retry"

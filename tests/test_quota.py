@@ -147,3 +147,85 @@ def test_quota_pause_stops_new_shots_and_records_nothing(tmp_path, monkeypatch):
     assert p.quota_until == 123.0
     assert len(blockers) == 3 and all("quota" in b for b in blockers)
     assert p.proj.ledger() == []
+
+
+def test_a_per_minute_429_is_not_a_daily_cap(monkeypatch, tmp_path):
+    """Gemini's per-minute 429 also says "exceeded your current quota"; it must not take the
+    link out until midnight Pacific. Message shapes from Google's real replies."""
+    j = _judge(monkeypatch, tmp_path, [JudgeLink(provider="g", model="gemini-a", vision=True)])
+    link = j.chain[0]
+    j._trip(link, "429 RESOURCE_EXHAUSTED. You exceeded your current quota. Quota exceeded for metric: "
+                  "generate_content_free_tier_requests, quotaId: GenerateRequestsPerMinutePerProjectPerModel-FreeTier"
+                  " 'retryDelay': '23s'")
+    assert not j.quota.out_until(link)
+    assert 0 < j.down_links()["g/gemini-a"] <= 23
+    j._trip(link, "429 RESOURCE_EXHAUSTED. You exceeded your current quota. Generate content requests per "
+                  "day limit exceeded on Free Tier. Please retry in 15h55m1.6s. 'retryDelay': '57301s'")
+    assert j.quota.out_until(link) == Q.next_reset()
+
+
+def test_direct_links_call_their_own_model_with_no_hidden_fallback(monkeypatch, tmp_path):
+    """Free quota is per model; the chain counts per link, so `_direct` must not hop models."""
+    monkeypatch.setattr(ProviderConfig, "load", classmethod(lambda cls, p=None: cls({})))
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    chain = [JudgeLink(provider="_direct", model="lite-a", vision=True),
+             JudgeLink(provider="_direct", model="lite-b", vision=True)]
+    j = R.Judge(Settings(judge_chain=chain, cache_dir=tmp_path, judge_patience=0), Cache(tmp_path))
+    asked = []
+
+    class G:
+        def json_images(self, prompt, images, schema, model=None):
+            asked.append(model)
+            if model == "lite-a":
+                raise R.GeminiError("503 UNAVAILABLE high demand")
+            return {"ai_generated": False}
+
+    monkeypatch.setattr(j, "_direct_client", lambda: G())
+    assert j.json_images("p", [b"x"], SCHEMA) == {"ai_generated": False}
+    assert asked == ["lite-a", "lite-b"]
+
+
+def test_the_gemini_client_in_chain_mode_never_switches_model(monkeypatch, tmp_path):
+    from ytauto.llm import gemini as GM
+    g = GM.Gemini.__new__(GM.Gemini)
+    g.fallback, g._down = False, {}
+    tried = []
+
+    def one(m, parts, schema, retries):
+        tried.append(m)
+        raise GM.GeminiError("down")
+
+    g._generate_one = one
+    with pytest.raises(GM.GeminiError):
+        g._generate("lite-a", [], None)
+    assert tried == ["lite-a"]
+
+
+def test_a_demand_spike_trips_a_link_briefly_not_for_five_minutes(monkeypatch, tmp_path):
+    """Google's 503 "high demand" clears in seconds (dozens per run were measured); the circuit
+    breaker should not take the model away for the usual 5 minutes."""
+    j = _judge(monkeypatch, tmp_path, [JudgeLink(provider="g", model="gemini-a", vision=True)])
+    j._trip(j.chain[0], "503 UNAVAILABLE. This model is currently experiencing high demand.")
+    assert 0 < j.down_links()["g/gemini-a"] <= R.OVERLOAD_SECONDS
+    assert not j.quota.out_until(j.chain[0])
+    j._trip(j.chain[0], "HTTP 500: something else broke")
+    assert j.down_links()["g/gemini-a"] > R.OVERLOAD_SECONDS
+
+
+def test_chain_mode_gemini_does_not_sleep_on_a_demand_spike(monkeypatch):
+    from ytauto.llm import gemini as GM
+    g = GM.Gemini.__new__(GM.Gemini)
+    g.fallback, g.calls, g.tokens = False, 0, 0
+    calls = []
+
+    class Models:
+        def generate_content(self, **kw):
+            calls.append(1)
+            raise RuntimeError("503 UNAVAILABLE. high demand")
+
+    g.client = type("C", (), {"models": Models()})()
+    g._types = type("T", (), {"GenerateContentConfig": lambda **k: k, "Content": lambda **k: k})
+    monkeypatch.setattr(GM.time, "sleep", lambda s: pytest.fail("slept on a 503 in chain mode"))
+    with pytest.raises(GM.GeminiError):
+        g._generate_one("m", [], None, 2)
+    assert len(calls) == 1, "straight on to the next chain link, no second attempt"

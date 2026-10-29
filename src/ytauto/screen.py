@@ -116,10 +116,12 @@ SB_SCHEMA = {
         "reason": {"type": "string"},
         "tiles": {"type": "array", "items": {"type": "integer"}},
         "match": {"type": "integer", "description": "0-100 for the best tile"},
+        "overlay_tiles": {"type": "array", "items": {"type": "integer"},
+                          "description": "thumbnails among tiles with text, captions, a title or a logo drawn over the footage"},
         "presenter_on_camera": {"type": "boolean"},
         "black_and_white": {"type": "boolean"},
     },
-    "required": ["usable", "tiles", "match", "presenter_on_camera", "black_and_white"],
+    "required": ["usable", "tiles", "match", "overlay_tiles", "presenter_on_camera", "black_and_white"],
 }
 
 SB_PROMPT = """This image is a contact sheet of ONE YouTube video: {n} numbered thumbnails taken in time
@@ -137,6 +139,8 @@ Return:
 - tiles: numbers of the thumbnails that show the subject, closest to the ideal shot first, at most 5
   ([] if none)
 - match: 0-100, how well the best of those thumbnails matches the ideal shot of the subject
+- overlay_tiles: those of your tiles with text, subtitles, a title or a channel logo drawn over the
+  footage ([] if none; signs and shop names that are part of the scene do not count)
 - presenter_on_camera: true if, in those thumbnails, a person is talking to the camera
 - black_and_white: true if that footage is black and white
 - reason: one sentence
@@ -149,26 +153,41 @@ def _sb_cache_key(c: Candidate, shot: Shot) -> tuple:
     return ("screen-sb2", c.source_id, b.subject, b.visual, ",".join(b.entities))
 
 
+def _tiles(raw) -> list[int]:
+    out = []
+    for x in raw or []:
+        try:
+            out.append(int(x))
+        except (ValueError, TypeError):
+            continue
+    return out
+
+
 def _sb_result(data: dict, sb: Storyboard) -> dict:
-    """Map a storyboard verdict (tile numbers) to the screening result shape (windows in seconds)."""
+    """Map a storyboard verdict (tile numbers) to the screening result shape (windows in seconds).
+
+    `overlay_tiles` is a soft signal only: thumbnails are ~160 px wide, too small to rule on a
+    watermark (verify and the benchmark do that on the full-resolution clip). It only reorders -
+    clean tiles are downloaded first, and a video whose every tile is flagged is `overlay_suspect`,
+    tried after the round's clean candidates. Measured: 12 of 30 downloads in a 12-shot run were
+    rejected for a watermark or burnt-in text that screening never looked for."""
     try:
         best = int(float(data.get("match", 0) or 0))
     except (ValueError, TypeError):
         best = 0
+    flagged = set(_tiles(data.get("overlay_tiles")))
     wins, seen = [], set()
-    for k, raw in enumerate(data.get("tiles") or []):
-        try:
-            tile = int(raw)
-        except (ValueError, TypeError):
-            continue
+    for k, tile in enumerate(_tiles(data.get("tiles"))):
         win = sb.window(tile)
         if win is None or tile in seen or win[1] - win[0] < 3:
             continue
         seen.add(tile)
         # keep the judge's best-first order; later tiles rank a little lower
         wins.append({"start": win[0], "end": win[1], "match": max(0, best - 3 * k),
-                     "description": f"storyboard tile {tile}"})
+                     "description": f"storyboard tile {tile}", "overlay": tile in flagged})
+    wins.sort(key=lambda w: w["overlay"])         # stable: clean tiles first, judge order kept
     return {"usable": bool(data.get("usable")), "reason": data.get("reason", ""), "windows": wins,
+            "overlay_suspect": bool(wins) and all(w["overlay"] for w in wins),
             "presenter_on_camera": bool(data.get("presenter_on_camera")),
             "black_and_white": bool(data.get("black_and_white")),
             "ai_or_animated": False, "watermark_or_logo": False, "looks_dated": False,
@@ -184,10 +203,13 @@ BATCH_SCHEMA = {
             "usable": {"type": "boolean"},
             "tiles": {"type": "array", "items": {"type": "integer"}},
             "match": {"type": "integer", "description": "0-100 for the best tile"},
+            "overlay_tiles": {"type": "array", "items": {"type": "integer"},
+                              "description": "thumbnails among tiles with text, captions, a title or a logo drawn over the footage"},
             "presenter_on_camera": {"type": "boolean"},
             "black_and_white": {"type": "boolean"},
             "reason": {"type": "string"}},
-        "required": ["video", "usable", "tiles", "match", "presenter_on_camera", "black_and_white"]}}},
+        "required": ["video", "usable", "tiles", "match", "overlay_tiles", "presenter_on_camera",
+                     "black_and_white"]}}},
     "required": ["videos"],
 }
 
@@ -208,6 +230,8 @@ Return `videos`: one entry per image, in order A, B, ..., each with:
 - tiles: that image's thumbnail numbers that show the subject, closest to the ideal shot first, at
   most 5 ([] if none)
 - match: 0-100, how well that image's best thumbnail matches the ideal shot of the subject
+- overlay_tiles: those of that image's tiles with text, subtitles, a title or a channel logo drawn
+  over the footage ([] if none; signs and shop names that are part of the scene do not count)
 - presenter_on_camera: true if, in those thumbnails, a person is talking to the camera
 - black_and_white: true if that footage is black and white
 - reason: one sentence

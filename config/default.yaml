@@ -27,6 +27,7 @@ screen_batch: 2         # storyboards per judge call (measured: usable agrees 15
 prerank: rank           # local CLIP orders candidates before any judge call: off | rank | filter
 prerank_margin: 0.04    # filter only: drop candidates this far below the best CLIP similarity
 shot_workers: 2         # shots selected at the same time (3 ran out of memory once on 15 GB with Chrome open)
+prefetch_ahead: 3        # shots prepared in the background (search, metadata, storyboards, CLIP); 0 = off
 screen_workers: 3       # candidates screened at the same time within one shot
 judge_concurrency: 4    # max AI-judge calls in flight at once (rate limits are the real ceiling)
 judge_patience: 60      # seconds to wait for a judge link to recover before giving up a shot
@@ -45,17 +46,26 @@ fallback_order: [pexels, pixabay, coverr, mixkit]
 # config at $HEART_CONFIG (read-only), or `_direct` = native google-genai + GEMINI_API_KEY.
 #   vision:  can analyse frame grids (local clip verification)
 #   youtube: can analyse a public YouTube URL without downloading it (pre-download screening)
-# A link that fails is skipped for 5 minutes. All verified working 2026-10-29.
+# A link that fails is skipped for 5 minutes.
 #   rpm / rpd: optional client-side caps (requests per minute / per day, see llm/quota.py). A link
-#   at its rpd is skipped without being called; a quota 429 marks it spent until midnight Pacific
-#   (Gemini) or for an hour (others). Leave rpd unset unless you know the real cap.
-#   `ytauto quota` shows today's use.
+#   at its rpd is skipped without being called; a daily-quota 429 marks it spent until midnight
+#   Pacific (Gemini) or for an hour (others); a per-minute 429 only for its retry delay.
+#   Leave rpd unset unless you know the real cap. `ytauto quota` shows today's use.
 judge_chain:
+  # Primary: your own GEMINI_API_KEY (.env), straight to Google - no proxy in between. It is a
+  # free-tier key, and free quota is per project *per model*, so each model is its own link and
+  # the chain moves on when one model's day is spent. Probed live 2026-10-29; the 2.5 models
+  # answer 404 "no longer available to new users" on this key.
+  - {provider: _direct,      model: "gemini-3.1-flash-lite",           vision: true, youtube: true, rpm: 15}
+  - {provider: _direct,      model: "gemini-3.5-flash-lite",           vision: true, youtube: true, rpm: 15}
+  - {provider: _direct,      model: "gemini-flash-lite-latest",        vision: true, youtube: true, rpm: 15}
+  # Fallback: providers from $HEART_CONFIG (another project's file; read, never written).
   - {provider: geminiopenai, model: "models/gemini-2.5-flash-lite",   vision: true, youtube: true, rpm: 15}
   - {provider: geminiopenai, model: "models/gemini-flash-lite-latest", vision: true, youtube: true, rpm: 15}
   # Reasoning model: needs a far bigger budget or it is truncated before it answers at all.
   - {provider: zai,          model: "GLM-4.6V-Flash",                 vision: true, max_tokens: 8192}
-  - {provider: _direct,      model: "gemini-3-flash-preview",         vision: true, youtube: true}
+  # Last: free tier allows only 20 requests/day on this model (from Google's own 429 message).
+  - {provider: _direct,      model: "gemini-3-flash-preview",         vision: true, youtube: true, rpd: 20}
 # Frame grid sent to vision models in place of video (3x2 tile @1.2fps = 6 frames).
 grid_cols: 3
 grid_rows: 2

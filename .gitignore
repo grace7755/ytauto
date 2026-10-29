@@ -7,3 +7,5 @@ __pycache__/
 .pytest_cache/
 .heart-config.json
 *.local.yaml
+
+chatgpt-test/

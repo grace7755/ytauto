@@ -22,7 +22,7 @@ Requires `ffmpeg`/`ffprobe` on PATH (already installed).
 | `.env` setting | What it gives you |
 | --- | --- |
 | `HEART_CONFIG` | Path to a shared OpenAI-compatible provider config (`{"providers":{"<name>":{"baseUrl","apiKey"}}}`). **Read-only** — never modified or copied, so the owning project is untouched and a key rotated there is picked up here. Unlocks the multi-provider chain. |
-| `GEMINI_API_KEY` | The native google-genai client, used as the `_direct` link in the chain. |
+| `GEMINI_API_KEY` | Your own Gemini key, called straight at Google as the `_direct` links - the **primary** judge. Free quota is per model, so each model is its own link; when one model's day is spent the chain moves to the next, then to the `HEART_CONFIG` providers. |
 
 With neither, the tool runs in **offline heuristic mode**: no pre-download screening or AI verification, only the
 local checks (resolution, blur, B&W, black/frozen, letterbox, faces, static watermark). Results are noticeably worse

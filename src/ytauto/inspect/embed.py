@@ -12,6 +12,7 @@ many shots (common: one good "Kyoto 4K walking tour" serves a dozen) is embedded
 from __future__ import annotations
 
 import io
+import os
 import threading
 from pathlib import Path
 
@@ -26,12 +27,17 @@ MEAN = np.array([0.48145466, 0.4578275, 0.40821073], dtype=np.float32)
 STD = np.array([0.26862954, 0.26130258, 0.27577711], dtype=np.float32)
 SIZE = 224
 CONTEXT = 77
+# Measured on this 12-core PC (546 tiles): 2 threads 37 ms/tile, 4 -> 23, 6 -> 18. Shots run in
+# parallel, so inference is serialised by a lock: one fast embedding at a time beats two slow ones
+# fighting for the same cores, and ffmpeg keeps the rest.
+THREADS = max(2, min(6, (os.cpu_count() or 4) // 2))
 
 
 class Clip:
     def __init__(self, model_dir: Path):
         self.dir = Path(model_dir)
         self._lock = threading.Lock()
+        self._run = threading.Lock()           # one inference at a time (see THREADS)
         self._vision = self._text = self._tok = None
 
     def _load(self):
@@ -50,7 +56,7 @@ class Clip:
 
             paths = {k: get(f) for k, f in FILES.items()}
             opts = ort.SessionOptions()
-            opts.intra_op_num_threads = 2          # shots run in parallel; keep the CPU for ffmpeg too
+            opts.intra_op_num_threads = THREADS      # see THREADS
             prov = ["CPUExecutionProvider"]
             self._vision = ort.InferenceSession(paths["vision"], opts, providers=prov)
             self._text = ort.InferenceSession(paths["text"], opts, providers=prov)
@@ -71,7 +77,8 @@ class Clip:
         out = []
         for i in range(0, len(imgs), 32):
             batch = np.stack([self._pixels(im) for im in imgs[i:i + 32]])
-            out.append(self._vision.run(None, {"pixel_values": batch})[0])
+            with self._run:
+                out.append(self._vision.run(None, {"pixel_values": batch})[0])
         e = np.concatenate(out) if out else np.zeros((0, 512), np.float32)
         return e / np.maximum(np.linalg.norm(e, axis=1, keepdims=True), 1e-8)
 
@@ -82,7 +89,8 @@ class Clip:
         ids = self._tok.encode(s).ids[:CONTEXT]
         if ids[-1] != 49407:                     # keep the end-of-text token the model pools on
             ids[-1] = 49407
-        e = self._text.run(None, {"input_ids": np.array([ids], dtype=np.int64)})[0][0]
+        with self._run:
+            e = self._text.run(None, {"input_ids": np.array([ids], dtype=np.int64)})[0][0]
         return e / max(float(np.linalg.norm(e)), 1e-8)
 
 

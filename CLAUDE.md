@@ -92,6 +92,24 @@ more lenient on fine detail (it passed a station *exterior* for an *inside* brie
 download, never quality: every clip still passes local checks, frame-grid verify and the dedicated
 AI check. Never take the AI-generated flag from thumbnails - that is the dedicated check's job.
 
+**Storyboard `overlay_tiles` only reorders, never rejects.** Thumbnails are ~160 px wide. Measured on
+39 past downloads (`scripts/measure_overlay_screen.py`): it never flagged a clean clip (0/18), but made
+only 3 of 21 videos that verify later rejected for a logo or captions `overlay_suspect`. So flagged
+tiles are downloaded last and an all-flagged video waits until the round's clean candidates were
+tried; the hard reject stays with verify on the full-resolution clip.
+
+**Judge-free work is prefetched** (`Selector.warm`, `prefetch_ahead: 3`, started from `select_all`): while
+workers wait on the judge, a background thread does upcoming shots' round-0 search, metadata,
+storyboard fetch and CLIP tile embeddings, all cached on disk. It makes no judge calls and no
+decisions, so a failure there is ignored. CLIP runs 6 threads under one lock (measured 37 -> 18
+ms/tile versus 2 threads), not two slow sessions fighting for cores.
+
+**Section downloads are stream-copied** (`download_section`, no `force_keyframes_at_cuts`). The
+copied frames line up with a re-encoded download to the frame, so window maths is unchanged; the
+re-encode only added a lossy generation. Download time (~12 s) is the transfer, not encoding.
+Storyboard windows are capped at 8 s (11 s downloaded): on 130 past sections a cut-free 4.5 s window
+still existed in 116/116 at 11 s, so the longer sections were only transfer time.
+
 **Free judge quota is requests per day, so calls saved are the main lever** (`llm/quota.py`). A 25-min
 video is ~300 shots; at ~11 judge calls per shot (measured, speed test) that was ~3,300 requests against
 ~1,000/day per free project. What brings it down, each measured before it was turned on:
@@ -134,6 +152,13 @@ interface (`json`, `json_youtube`, `json_video_file`), so call sites do not know
 answered. Links come from `judge_chain` in `config/default.yaml`; `provider` is a key in the
 provider config at `$HEART_CONFIG`, or `_direct` for native google-genai + `GEMINI_API_KEY`.
 - `$HEART_CONFIG` belongs to **another project**. Read it, never write or copy it.
+- `_direct` links (the user's own free-tier key, straight to Google) come first. Free quota is per
+  project **per model**, so each Gemini model is its own link, and `Gemini(fallback=False)` calls
+  exactly `link.model` - its old internal model-hopping spent quotas the chain was not counting.
+  A daily-quota 429 ("requests per day") trips a link until midnight Pacific; a per-minute 429
+  says "exceeded your current quota" too and only trips for its `retryDelay`.
+  A 503 "high demand" / 504 (dozens per run on 2026-10-29) moves on to the next link with no sleep and
+  trips the link for only 60 s, not 5 minutes.
 - A failing link is circuit-broken for 5 min. Failures include HTTP errors, empty `content`, and a
   reply truncated before any answer - all observed in practice. A 429 "exceeded your current
   quota" is a daily cap and trips the link for an hour. When every link fails, the chain waits

@@ -69,7 +69,31 @@ class Pipeline:
         paused = threading.Event()
         lock = threading.Lock()
 
+        started = [0]                      # shots a worker has picked up, for the prefetcher
+        cond = threading.Condition()
+
+        def prefetch():
+            """Prepare the judge-free work of upcoming shots while the workers wait on the judge.
+            Stays `prefetch_ahead` shots in front of the workers, so it never runs far ahead of
+            what a pause or an interrupt would leave undone."""
+            for i, sh in enumerate(todo):
+                if i < workers:
+                    continue                      # the workers start these at once
+                with cond:
+                    cond.wait_for(lambda: paused.is_set() or i < started[0] + self.s.prefetch_ahead)
+                if paused.is_set():
+                    return                        # quota pause, or the run has ended
+                if i < started[0]:
+                    continue                      # a worker already has it
+                try:
+                    sel.warm(sh)
+                except Exception as e:            # purely an optimisation: never fail the run
+                    log.debug("prefetch for shot %d failed: %s", sh.id, str(e)[:160])
+
         def one(sh: Shot) -> str | None:
+            with cond:
+                started[0] += 1
+                cond.notify_all()
             if paused.is_set():
                 return f"shot {sh.id}: not started - judge quota spent; `run` again to continue"
             log.info("== shot %d/%d [%.1f-%.1fs] %s", sh.id + 1, len(self.shots), sh.start, sh.end, sh.text[:60])
@@ -93,11 +117,20 @@ class Pipeline:
             return None
 
         workers = max(1, min(self.s.shot_workers, len(todo)))
-        if workers == 1:
-            results = [one(sh) for sh in todo]
-        else:
-            with ThreadPoolExecutor(workers) as ex:
-                results = list(ex.map(one, todo))
+        pre = None
+        if self.gem and self.s.prefetch_ahead > 0 and len(todo) > workers:
+            pre = threading.Thread(target=prefetch, name="prefetch", daemon=True)
+            pre.start()
+        try:
+            if workers == 1:
+                results = [one(sh) for sh in todo]
+            else:
+                with ThreadPoolExecutor(workers) as ex:
+                    results = list(ex.map(one, todo))
+        finally:
+            paused.set()                          # releases the prefetcher
+            with cond:
+                cond.notify_all()
         return [b for b in results if b]
 
     def render(self) -> Path:

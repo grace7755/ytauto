@@ -95,6 +95,7 @@ class Settings(BaseModel):
     # speed: shots selected concurrently, and candidates screened concurrently within a shot.
     # Judge rate limits are the ceiling - raising these past ~4 mostly buys 429s.
     shot_workers: int = 2
+    prefetch_ahead: int = 3          # shots whose judge-free work is prepared in the background (0 = off)
     screen_workers: int = 3
     judge_concurrency: int = 4        # max judge calls in flight at once, across all threads
     # seconds to wait for a judge link to recover before giving a shot up as "unavailable"

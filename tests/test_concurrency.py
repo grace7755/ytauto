@@ -257,3 +257,116 @@ def test_batched_screen_maps_letters_back_to_the_right_videos(tmp_path):
 
     again = screen_storyboards(Never(), cands, shot, sbs)
     assert again[0]["usable"] and not again[1]["usable"]
+
+
+def test_overlay_suspects_are_tried_after_the_clean_candidates(tmp_path, monkeypatch):
+    """A usable video whose every proposed thumbnail shows text or a logo is downloaded only once
+    the clean ones failed - deferred, never rejected (it still wins when it is all there is)."""
+    import ytauto.select as SEL
+    from ytauto.sources.storyboard import Storyboard
+
+    s = Settings(rounds_per_shot=1, screen_top_k=3, prerank="off", screen_batch=1)
+    proj = Project(tmp_path / "p")
+
+    class YT:
+        def search(self, q, n):
+            return [Candidate(provider="youtube", source_id=v, url=f"https://youtu.be/{v}",
+                              height=1080, duration=600, title=v) for v in "abc"]
+
+        def details(self, c):
+            return c
+
+        def prefilter(self, c):
+            return None
+
+        def storyboard(self, c):
+            return Storyboard(c.source_id, b"j", [0.0, 10.0, 20.0], 10.0, 30.0)
+
+        def download_section(self, c, a, b, d):
+            return tmp_path / f"{c.source_id}.mp4"
+
+    def fake_screen(gem, c, shot, **kw):
+        return {"usable": True, "reason": "", "presenter_on_camera": False, "black_and_white": False,
+                "overlay_suspect": c.source_id == "a",
+                "windows": [{"start": 8.0, "end": 20.0, "match": 90, "overlay": c.source_id == "a"}]}
+
+    monkeypatch.setattr(SEL, "screen", fake_screen)
+    monkeypatch.setattr(SEL, "text_score", lambda c, q, e: {"a": 90, "b": 80, "c": 70}[c.source_id])
+    shot = Shot(id=0, segment=0, start=0, end=5, text="t",
+                brief=Brief(visual="v", entities=["e"], youtube_queries=["q"]))
+    sel = Selector(s, proj, Cache(tmp_path / "c"), YT(), object(), {}, [shot])
+    picked = []
+
+    def try_file(shot, c, path, hint, prior, off):
+        picked.append(c.source_id)
+        ok = c.source_id == "a"                   # only the suspect turns out fine
+        return Decision(shot=0, status="accepted" if ok else "rejected", provider="youtube",
+                        source_id=c.source_id, url="u"), None
+
+    monkeypatch.setattr(sel, "_try_file", try_file)
+    d = sel._youtube(shot, [])
+    assert picked == ["b", "c", "a"], "the top-ranked suspect waits for the clean ones"
+    assert d.source_id == "a"
+
+
+def _pipeline_with(tmp_path, monkeypatch, sel_cls, n_shots=6, **kw):
+    import ytauto.pipeline as PL
+    s = Settings(shot_workers=2, **kw)
+    pipe = PL.Pipeline.__new__(PL.Pipeline)
+    pipe.s, pipe.proj, pipe.cache = s, Project(tmp_path / "p"), Cache(tmp_path / "c")
+    pipe.yt, pipe.gem, pipe.providers = None, object(), {}
+    pipe.shots = [Shot(id=i, segment=i, start=i * 5.0, end=i * 5.0 + 5, text="t",
+                       brief=Brief(visual="v", entities=["e"], youtube_queries=["q"])) for i in range(n_shots)]
+    monkeypatch.setattr(PL, "Selector", sel_cls)
+    return pipe
+
+
+def test_prefetch_prepares_upcoming_shots_while_workers_are_busy(tmp_path, monkeypatch):
+    """Judge-free work for shot i+1.. runs while shot i waits on the judge - never more than
+    `prefetch_ahead` shots in front of the workers, and a failing warm-up changes nothing."""
+    warmed, selected, gate = [], [], threading.Event()
+
+    class Sel:
+        def __init__(self, *a, **k):
+            pass
+
+        def warm(self, shot):
+            warmed.append(shot.id)
+            if shot.id == 3:
+                raise RuntimeError("network blip")
+
+        def select(self, shot):
+            selected.append(shot.id)
+            if shot.id in (0, 1):
+                gate.wait(5)                     # the first two shots sit on the (slow) judge
+            return Decision(shot=shot.id, status="accepted", provider="youtube", source_id="x", url="u")
+
+    pipe = _pipeline_with(tmp_path, monkeypatch, Sel, prefetch_ahead=2)
+    t = threading.Thread(target=pipe.select_all)
+    t.start()
+    deadline = time.time() + 5
+    while time.time() < deadline and len(warmed) < 2:
+        time.sleep(0.02)
+    assert warmed == [2, 3][: len(warmed)] and len(warmed) == 2, "warms shots 2-3 while 0-1 are busy"
+    assert 4 not in warmed, "stays prefetch_ahead shots in front of the workers"
+    gate.set()
+    t.join(10)
+    assert not t.is_alive()
+    assert sorted(selected) == list(range(6)), "a failed warm-up never fails or skips a shot"
+
+
+def test_prefetch_off_and_offline_do_not_start_a_thread(tmp_path, monkeypatch):
+    class Sel:
+        def __init__(self, *a, **k):
+            pass
+
+        def warm(self, shot):
+            pytest.fail("prefetch must be off")
+
+        def select(self, shot):
+            return Decision(shot=shot.id, status="accepted", provider="youtube", source_id="x", url="u")
+
+    _pipeline_with(tmp_path, monkeypatch, Sel, prefetch_ahead=0).select_all()
+    p = _pipeline_with(tmp_path, monkeypatch, Sel, prefetch_ahead=3)
+    p.gem = None                                   # offline mode: no judge, nothing to wait on
+    p.select_all()

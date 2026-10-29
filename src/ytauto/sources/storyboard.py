@@ -41,9 +41,12 @@ class Storyboard:
     step: float             # seconds between consecutive tiles in the sheet
     duration: float
 
-    def window(self, tile: int, max_len: float = 16.0) -> tuple[float, float] | None:
+    def window(self, tile: int, max_len: float = 6.0) -> tuple[float, float] | None:
         """Source window around tile `tile`: from just before it to the next tile, but never less
-        than MIN_AHEAD past it. Measured: a 1-minute video has tiles ~1 s apart, so "to the next
+        than MIN_AHEAD past it, capped at `max_len` past it. The cap (6 s, so an 8 s window and an
+        11 s download) was measured on 130 downloaded sections: a cut-free 4.5 s window still existed
+        in 116 of 116 at 11 s, and in 110 at 8 s - the extra seconds were pure transfer time.
+        Measured: a 1-minute video has tiles ~1 s apart, so "to the next
         tile" gave ~3 s windows that screening dropped - losing five 85-95% matches in one run."""
         if not 0 <= tile < len(self.times):
             return None
