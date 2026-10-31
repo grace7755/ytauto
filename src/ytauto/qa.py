@@ -123,3 +123,49 @@ def run_qa(s: Settings, proj: Project, shots: list[Shot], video: Path, expected_
 
     r.contact_sheet = str(contact_sheet(video, shots, proj.path("output", "contact_sheet.jpg")))
     return r
+
+
+def _middle_frame(clip: Path):
+    cap = cv2.VideoCapture(str(clip))
+    n = cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0
+    cap.set(cv2.CAP_PROP_POS_FRAMES, int(n // 2))
+    ok, f = cap.read()
+    cap.release()
+    return f if ok else None
+
+
+def run_qa_clips(s: Settings, proj: Project, shots: list[Shot]) -> QAResult:
+    """QA without a rendered video, for the Remotion workflow (the ffmpeg `final.mp4` is never used
+    there). Same timeline-vs-ledger audit and duplicate check as `run_qa`, read from each shot's clip
+    instead of the render. Black/frozen footage is already a hard reject per clip (`inspect/checks.py`),
+    and resolution/fps/duration belong to the Remotion render, checked by the film workflow."""
+    r = QAResult()
+    hashes: list[tuple[int, imagehash.ImageHash]] = []
+    tiles = []
+    for sh in shots:
+        d = proj.accepted(sh.id)
+        if d is None:
+            r.fail(f"shot {sh.id} has no accepted clip in the ledger", sh.id)
+            continue
+        if d.status == "weak":
+            r.issues.append(f"shot {sh.id} is a WEAK match (score {d.score.total if d.score else 0:.0f}) - review manually")
+        f = _middle_frame(Path(d.clip_path))
+        if f is not None:
+            hashes.append((sh.id, imagehash.phash(Image.fromarray(cv2.cvtColor(f, cv2.COLOR_BGR2RGB)))))
+            t = cv2.resize(f, (320, 180))
+            cv2.putText(t, str(sh.id), (6, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+            tiles.append(t)
+    for i, (ia, ha) in enumerate(hashes):
+        for ib, hb in hashes[i + 1:]:
+            if ha - hb <= 4 and not _declared_reuse(proj, ia, ib):
+                r.fail(f"shots {ia} and {ib} look like duplicates", ib)
+    r.info = {"mode": "clips (no render)"}
+    if tiles:                                  # the reviewer looks at it, same layout as `contact_sheet`
+        cols = 6
+        while len(tiles) % cols:
+            tiles.append(np.zeros_like(tiles[0]))
+        out = proj.path("output", "contact_sheet.jpg")
+        out.parent.mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(str(out), cv2.vconcat([cv2.hconcat(tiles[i:i + cols]) for i in range(0, len(tiles), cols)]))
+        r.contact_sheet = str(out)
+    return r

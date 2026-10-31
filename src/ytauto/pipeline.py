@@ -17,7 +17,7 @@ from .llm.router import Judge, JudgeError, QuotaExhausted, make_judge
 from .log import log
 from .models import Brief, Segment, Shot
 from .planner import plan
-from .qa import QAResult, run_qa
+from .qa import QAResult, run_qa, run_qa_clips
 from .report import build
 from .select import Selector
 from .sources.stock import make_providers
@@ -160,9 +160,9 @@ class Pipeline:
         out = self.proj.path("output", "final.mp4")
         return assemble(self.s, self.proj, self.shots, clips, self.vo, out)
 
-    def _finish_timing(self, t0: float):
+    def _finish_timing(self, t0: float, name: str = "timings.json"):
         elapsed = time.time() - t0
-        timing.write(self.proj.path("logs", "timings.json"), elapsed)
+        timing.write(self.proj.path("logs", name), elapsed)
         log.info(timing.summary(elapsed))
 
     def run(self, wait: bool = False) -> dict:
@@ -231,10 +231,7 @@ class Pipeline:
         qa: QAResult | None = None
         if not blockers:
             for loop in range(self.s.qa_max_loops + 1):
-                with timing.stage("render"):
-                    video = self.render()
-                with timing.stage("qa"):
-                    qa = run_qa(self.s, self.proj, self.shots, video, self.shots[-1].end)
+                qa = self._render_and_qa()
                 for i in qa.issues:
                     log.info("QA: %s", i)
                 if qa.passed or loop == self.s.qa_max_loops or not qa.bad_shots:
@@ -258,16 +255,51 @@ class Pipeline:
         log.info("report: %s", self.proj.path("report.html"))
         return data
 
-    def redo(self, shot_id: int) -> dict:
-        self.prepare()
-        self.proj.invalidate(shot_id, "manual redo")
-        self.exporter = self.make_exporter()      # keeps an exported composition in step
+    def wants_render(self) -> bool:
+        """Build the ffmpeg `final.mp4`? `ffmpeg_render: auto` skips it when clips go to Remotion
+        (`remotion_export`): that workflow renders the film in Remotion and never used this file,
+        which cost a full render on every `run` and every `redo`."""
+        mode = str(self.s.ffmpeg_render).lower()
+        if mode in ("always", "true", "on"):
+            return True
+        if mode in ("never", "false", "off"):
+            return False
+        return not self.s.remotion_export
+
+    def _render_and_qa(self) -> QAResult:
+        """Render + full QA, or (no render) the same ledger and duplicate checks on the clips."""
+        if not self.wants_render():
+            with timing.stage("qa (clips)"):
+                return run_qa_clips(self.s, self.proj, self.shots)
+        with timing.stage("render"):
+            video = self.render()
+        with timing.stage("qa"):
+            return run_qa(self.s, self.proj, self.shots, video, self.shots[-1].end)
+
+    def redo(self, shot_ids: int | list[int]) -> dict:
+        """Re-select one or more shots in ONE process: one `prepare()`, the shots run `shot_workers`
+        at a time with prefetch, then one export and one QA. Before, each shot was its own process
+        with its own full render and QA (~4 min a shot on the 5-guns film)."""
+        ids = [shot_ids] if isinstance(shot_ids, int) else list(dict.fromkeys(shot_ids))
+        t0 = time.time()
+        timing.reset()
         try:
-            blockers = self.select_all(only={shot_id})
+            self.prepare()
+            bad = [i for i in ids if i not in {sh.id for sh in self.shots}]
+            if bad:
+                raise ValueError(f"no such shot id(s): {bad} (shots are 0-{len(self.shots) - 1})")
+            for sid in ids:
+                self.proj.invalidate(sid, "manual redo")
+            self.exporter = self.make_exporter()      # keeps an exported composition in step
+            try:
+                with timing.stage("select (wall)"):
+                    blockers = self.select_all(only=set(ids))
+            finally:
+                if self.exporter is not None:
+                    with timing.stage("export (wait)"):
+                        self.exporter.finish(self.shots)
+                self.exporter = None
+            qa = self._render_and_qa()
+            return build(self.proj, self.title, self.shots, qa, blockers)
         finally:
-            if self.exporter is not None:
-                self.exporter.finish(self.shots)
-            self.exporter = None
-        video = self.render()
-        qa = run_qa(self.s, self.proj, self.shots, video, self.shots[-1].end)
-        return build(self.proj, self.title, self.shots, qa, blockers)
+            self._finish_timing(t0, "timings-redo.json")   # never overwrites the run's own timings

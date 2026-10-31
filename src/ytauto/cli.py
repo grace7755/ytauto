@@ -45,7 +45,9 @@ def run(transcript: Path, title: Optional[str] = typer.Option(None, help="Projec
                    " (or add --wait) to continue.")
         raise typer.Exit(3)
     bad = [r for r in data["shots"] if r["status"] in ("weak", "MISSING")]
-    typer.echo(f"\nvideo : {p.proj.path('output', 'final.mp4')}\nreport: {p.proj.path('report.html')}")
+    if p.wants_render():
+        typer.echo(f"\nvideo : {p.proj.path('output', 'final.mp4')}")
+    typer.echo(f"report: {p.proj.path('report.html')}")
     typer.echo(f"share of running time: {data['shares']}   clips used twice: {len(data['reused_clips'])}")
     for prob in data["reuse_problems"]:
         typer.echo(f"REUSE RULE BROKEN: {prob}")
@@ -77,18 +79,41 @@ def search(query: str, n: int = 10, config: Optional[Path] = None):
                    f"{c.title[:60]}{'   [skip: ' + why + ']' if why else ''}")
 
 
+def _shot_ids(text: str) -> list[int]:
+    """`7`, `3,7,12` or `3 7 12` -> [3, 7, 12]."""
+    try:
+        return [int(x) for x in text.replace(",", " ").split()]
+    except ValueError:
+        raise typer.BadParameter(f"shot ids must be numbers, e.g. `--shot 3,7,12` (got {text!r})")
+
+
 @app.command()
-def redo(transcript: Path, shot: Optional[int] = typer.Argument(None),
-         shot_opt: Optional[int] = typer.Option(None, "--shot", help="Shot id (same as the positional SHOT)."),
-         title: Optional[str] = None, vo: Optional[Path] = None, config: Optional[Path] = None):
-    """Replace one shot's clip and re-render. `redo script.txt 7` and `redo script.txt --shot 7`
-    are the same; the docs and blocker messages use the --shot form."""
-    sid = shot if shot is not None else shot_opt
-    if sid is None:
-        raise typer.BadParameter("give a shot id: `redo script.txt 7` or `--shot 7`")
+def redo(transcript: Path, shot: Optional[str] = typer.Argument(None),
+         shot_opt: Optional[str] = typer.Option(None, "--shot", help="Shot id(s): 7 or 3,7,12 (same as the positional SHOT)."),
+         title: Optional[str] = None, vo: Optional[Path] = None, config: Optional[Path] = None,
+         render: Optional[bool] = typer.Option(None, "--render/--no-render",
+                                               help="Build the ffmpeg final.mp4 (default: only when not exporting to Remotion)")):
+    """Replace one or more shots' clips in one go: `redo script.txt --shot 3,7,12`. All shots run in one
+    process, side by side (`shot_workers`), with one export and one QA at the end."""
+    text = shot if shot is not None else shot_opt
+    if not text:
+        raise typer.BadParameter("give shot id(s): `redo script.txt 7` or `--shot 3,7,12`")
     p = _pipe(transcript, title, vo, config, False)
-    p.redo(sid)
-    typer.echo(f"re-rendered {p.proj.path('output', 'final.mp4')}")
+    if render is not None:
+        p.s.ffmpeg_render = "always" if render else "never"
+    data = p.redo(_shot_ids(text))
+    if p.quota_until:
+        typer.echo(f"PAUSED: the judge's daily quota is spent; run the same redo again after "
+                   f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(p.quota_until))}.")
+        raise typer.Exit(3)
+    if p.wants_render():
+        typer.echo(f"re-rendered {p.proj.path('output', 'final.mp4')}")
+    else:
+        typer.echo("clips re-selected and exported (no ffmpeg render: the film is rendered in Remotion)")
+    for b in data["blockers"]:
+        typer.echo(f"BLOCKER: {b}")
+    if data["qa"] and data["qa"]["issues"]:
+        typer.echo("QA:\n  " + "\n  ".join(data["qa"]["issues"]))
 
 
 @app.command()
@@ -132,7 +157,8 @@ def finish(transcript: Path, vo: Path = typer.Option(..., help="Voice-over audio
     p = _pipe(transcript, title, None, config, False)
     video = p.proj.path("output", "final.mp4")
     if not video.exists():
-        raise typer.BadParameter(f"run the project first: {video} is missing")
+        raise typer.BadParameter(f"run the project first: {video} is missing (with `remotion_export` set, "
+                                 "add `ffmpeg_render: always` to the config to build it)")
     data = yaml.safe_load(spec.read_text(encoding="utf-8")) if spec else {}
 
     def asset(v, sub):

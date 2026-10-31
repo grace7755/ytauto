@@ -154,6 +154,9 @@ class Settings(BaseModel):
     remotion_bake: bool = True
     remotion_grain: str | None = None   # grain overlay video baked in (blend overlay), optional
     remotion_dust: str | None = None    # particles-on-black video baked in (blend screen), optional
+    # build the ffmpeg final.mp4 (+ QA on it) in `run`/`redo`: auto = only when not exporting to
+    # Remotion (that workflow renders in Remotion and never used it) | always | never
+    ffmpeg_render: str = "auto"
     title_blacklist: list[str] = Field(default_factory=lambda: [
         "ai generated", "ai-generated", "sora", "veo 3", "kling", "midjourney",
         "reaction", "podcast", "slideshow", "gameplay", "minecraft", "anime"])
