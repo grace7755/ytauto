@@ -212,3 +212,11 @@ record those findings.
 - `Decision.credit` holds a still's author; `report.py` writes `output/credits.txt` (CC-BY only) and `shares` / `reused_clips` / `reuse_problems` in `report.json`.
 - The planner cache key is `plan-shots-v4` (the `generic` field); an old cached plan is re-planned.
 - Tests: `tests/test_production3.py` (all offline; two need ffmpeg).
+
+## Round 4 (31 Oct 2026)
+
+- `benchmark.local_rejects` is the free-check half of `evaluate`; `_try_file` never sends a clip that fails it to the judge (note carries `[AI check deferred]`).
+- Per-shot download budget: `Selector._downloads` / `_over_budget`, base taken at the start of each `select()`.
+- `lastresort.py` is the `LastResort` mixin of `Selector` (`_keep_for_crop`, `_crop_logo`, `_reuse`, `_still`, `_judge_made_clip`). Tests patch a name on both modules (`_patch` in `tests/test_production3.py`).
+- `film.py` + `ytauto film`: builds `film.json` (see the module docstring). `sfx.load` accepts a `film.json` as well as an `sfx.json`.
+- Remotion side: `D:\remotion\my-video\src\doc-kit\DocFilm.tsx` (registered once in `Root.tsx` as `DocFilm`, `--props='{"slug":"<slug>"}'`).

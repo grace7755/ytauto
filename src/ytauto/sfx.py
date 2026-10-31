@@ -20,7 +20,7 @@ from pathlib import Path
 
 # kind -> (priority, default sound, dB under the voice peak). Higher priority survives a clash.
 KINDS: dict[str, tuple[int, str, float]] = {
-    "hook": (5, "splash_dive", 8.0),
+    "hook": (5, "riser", 8.0),
     "impact": (4, "impact_low", 8.0),
     "chapter": (3, "whoosh_deep", 10.0),
     "statbig": (2, "shimmer", 12.0),
@@ -230,4 +230,10 @@ def audit(p: dict, vo: Path, audio_dir: Path, shots: list[dict], video: Path | N
 
 
 def load(path: Path) -> dict:
-    return json.loads(Path(path).read_text(encoding="utf-8"))
+    """An sfx plan: an `sfx.json` from `plan`, or a `film.json` (its "sfx" entry)."""
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    if "cues" not in data and isinstance(data.get("sfx"), dict):
+        return data["sfx"]
+    if "cues" not in data:
+        raise ValueError(f"{path} has no sound plan (run `ytauto film --audio-dir ...` or `ytauto sfx-plan`)")
+    return data

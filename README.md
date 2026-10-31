@@ -144,7 +144,6 @@ storyboard screening).
 
 | setting | what it does |
 | --- | --- |
-| `direct_verify_video: false` | Native Gemini link judges the clip as a frame grid (like every other link). Measured 4.2 s vs 12.2 s mean per verify. `true` = old inline video. |
 | `judge_hedge_after: 8` | A judge call slower than 8 s (or 2.5x its link's usual time) is also sent to the next link; first answer wins. `0` = off. |
 | `download_ahead: true` | The next screened candidate's section downloads while the current clip is cut and judged. |
 | `defer_ai_check: true` | Skips the extra "is it AI footage" call for clips already rejected on score; run later only if that clip becomes a weak match. |
@@ -257,3 +256,25 @@ grain/dust/filters (2.5x). Concurrency 10 (83 s) and `--gl=angle` (77 s) were sl
 
 Measured/known limits: GL Transitions were tried and not adopted (see `VIDEO-PRODUCTION-GUIDE.md`).
 Everything above was checked with unit tests (270 pass) and one real check per feature; no before/after timing run.
+
+## Round 4 (speed, one data-driven film, tidier code)
+
+Measured on the Philippines run first (87 shots; 274 downloads, 336 judge calls, 77 accepted + 10 weak clips):
+1. **No judge call for a clip a free check already rejects** (`benchmark.local_rejects`: resolution, B&W, black,
+   frozen, blur, letterbox, face). 81 of 347 judge calls went to such clips. If one is later promoted to a weak match the
+   AI-footage question is still asked then.
+2. **`blur_threshold` 60 -> 40.** Of 18 clips rejected at 40-59, 9 were rated relevant (70-100) by the judge, "slightly soft"
+   (underwater, drone). Below 40 the verdicts were wrong-subject or synthetic. `min_score` still guards quality.
+3. **`max_downloads_per_shot: 8`.** 14 of 87 shots took 8+ downloads (up to 25) and 10 of those still ended weak. Past the
+   budget a shot goes to stock, a still, a reuse, then a weak match. Counted per `select()`, so `redo` gets a fresh budget.
+4. **`ytauto film`**: one `film.json` for the reusable `DocFilm` Remotion composition (`src/doc-kit/DocFilm.tsx`, fetched
+   with `calculateMetadata`, the documented data-driven pattern): camera moves, transitions, chapters, stat cards, place chips,
+   title card, caption words and the sound plan. One AI call picks chapters / stats / places / tagline; `film.check_facts` drops
+   anything the narration does not say (a stat's number must be in its sentence, place names are re-spelled as the narration
+   spells them), and the cards are timed to the spoken words. Checked against the hand-made Philippines film: same footage,
+   grade, title, stat card and captions; 7,641 appeared at 28.36 s (hand-timed: 28.2 s). A new film needs no new Remotion code.
+5. **Code:** the last-resort paths (logo crop, reuse, stills) moved from `select.py` to `lastresort.py` and share one
+   `_judge_made_clip`; `select.py` 1,024 -> 846 lines. Removed `direct_verify_video` (measured 3x slower, off) and the unused
+   `pydantic-settings` dependency.
+6. **Nibedita:** workflow `yt-film` (script + voice-over -> finished film) with agents `yt-film-maker` and `yt-video-reviewer`
+   (now driven by `review-shots`).

@@ -622,12 +622,10 @@ class Judge:
                     {"type": "image_url", "image_url": {"url": data_url}}]
 
         def direct_call(g, m):
-            if self.s.direct_verify_video:
-                return g.json_video_file(Path(path), prompt, schema, fps=fps, model=m)
             # The same frame grid every other link gets. Measured on 10 known clips with the same
             # model: video 12.2 s mean (median 4.7, one 62 s) vs grid 4.2 s (median 2.8), identical
             # verdicts within 10 points, and the grid flagged the "ON RIDE" watermark the video
-            # verdict only called text. Inline video is the slow tail of every verify.
+            # verdict only called text. Inline video was the slow tail of every verify, so it is not offered.
             jpeg = base64.b64decode(data_url.split(",", 1)[1])
             return g.json_images(grid_hint(cols, rows) + "\n\n" + prompt, [jpeg], schema, model=m)
 

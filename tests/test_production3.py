@@ -9,6 +9,25 @@ from ytauto.select import Selector
 from ytauto.state import Project
 
 
+import ytauto.lastresort as _LR
+import ytauto.select as _SELMOD
+
+
+class _Both:
+    """The last-resort paths live in lastresort.py and the rest of selection in select.py; a test patches a
+    name (cut_clip, probe, verify_clip, ...) on whichever module uses it by patching it on both."""
+    def __getattr__(self, name):
+        return getattr(_SELMOD, name) if hasattr(_SELMOD, name) else getattr(_LR, name)
+
+
+def _patch(monkeypatch, name, value):
+    for mod in (_SELMOD, _LR):
+        monkeypatch.setattr(mod, name, value, raising=False)
+
+
+_MODS = _Both()
+
+
 def _sel(tmp_path, shots=(), **kw):
     s = Settings(cache_dir=tmp_path / "cache", projects_dir=tmp_path / "p", library=False, **kw)
     proj = Project(tmp_path / "p" / "demo")
@@ -149,13 +168,13 @@ def _still_selector(tmp_path, monkeypatch, verdict, **kw):
                                                   license="Pexels License", direct_url="x")]
         def fetch(self, c, dest): return img
     sel._photos = {"pexels": P()}
-    import ytauto.select as SEL
-    monkeypatch.setattr(SEL, "verify_still", lambda *a, **k: verdict)
-    monkeypatch.setattr(SEL, "motion_clip", lambda s, image, out, dur, motion: out.write_bytes(b"x") or out)
+    SEL = _MODS
+    _patch(monkeypatch, "verify_still", lambda *a, **k: verdict)
+    _patch(monkeypatch, "motion_clip", lambda s, image, out, dur, motion: out.write_bytes(b"x") or out)
     from ytauto.inspect.checks import CheckResult
-    monkeypatch.setattr(SEL, "run_checks", lambda p: CheckResult(blur=300, saturation=0.4, n_frames=3))
+    _patch(monkeypatch, "run_checks", lambda p: CheckResult(blur=300, saturation=0.4, n_frames=3))
     from ytauto.inspect.probe import MediaInfo
-    monkeypatch.setattr(SEL, "probe", lambda p: MediaInfo(width=1920, height=1080, duration=4.0, fps=30, has_audio=False, codec="h264") if "has_audio" in MediaInfo.__dataclass_fields__ else None)
+    _patch(monkeypatch, "probe", lambda p: MediaInfo(width=1920, height=1080, duration=4.0, fps=30, has_audio=False, codec="h264") if "has_audio" in MediaInfo.__dataclass_fields__ else None)
     return sel, sh, proj
 
 
@@ -221,7 +240,7 @@ def test_sfx_plan_sets_levels_under_the_voice_and_the_audit_checks_them(tmp_path
         subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", f"sine=f={freq}:d={secs}",
                         "-af", f"volume={vol}", str(tmp_path / name)], check=True)
     tone("vo.mp3", 220, 30, 0.5)
-    for n, f in (("splash_dive", 300), ("whoosh_deep", 500), ("tick", 900)):
+    for n, f in (("riser", 300), ("whoosh_deep", 500), ("tick", 900)):
         tone(f"{n}.mp3", f, 2, 0.9)
     tone("amb.mp3", 120, 5, 0.3)
     events = [{"kind": "hook", "at": 0.1}, {"kind": "chapter", "at": 10.0}, {"kind": "stat", "at": 20.0}]
@@ -288,7 +307,7 @@ def test_corner_crop_keeps_the_side_away_from_the_logo():
 
 
 def _logo_case(tmp_path, monkeypatch, height=2160, corner="bottom-right", rejects=("watermark / channel logo (AI)",), second=None):
-    import ytauto.select as SEL
+    SEL = _MODS
     sh = Shot(id=4, segment=1, start=0, end=4, text="x", brief=Brief(subject="reef", setting="Philippines"))
     sel, proj = _sel(tmp_path, [sh])
     sel.gem = object()
@@ -298,11 +317,11 @@ def _logo_case(tmp_path, monkeypatch, height=2160, corner="bottom-right", reject
     from ytauto.models import ClipScore
     sel._keep_for_crop(sh, c, tmp_path / "src.mp4", 5.0, 4.0, 100.0, True, None, info, list(rejects), verdict, ClipScore(total=80))
     made = []
-    monkeypatch.setattr(SEL, "cut_clip", lambda s, src, a, want, out, avail=None, crop=None: made.append(crop) or out.write_bytes(b"x"))
-    monkeypatch.setattr(SEL, "probe", lambda p: MediaInfo(width=1920, height=1080, duration=4.0, fps=30, has_audio=False, codec="h264"))
-    monkeypatch.setattr(SEL, "run_checks", lambda p: CheckResult(blur=300, saturation=0.4, n_frames=3))
+    _patch(monkeypatch, "cut_clip", lambda s, src, a, want, out, avail=None, crop=None: made.append(crop) or out.write_bytes(b"x"))
+    _patch(monkeypatch, "probe", lambda p: MediaInfo(width=1920, height=1080, duration=4.0, fps=30, has_audio=False, codec="h264"))
+    _patch(monkeypatch, "run_checks", lambda p: CheckResult(blur=300, saturation=0.4, n_frames=3))
     good = {**GOOD, "watermark_or_logo": False, "watermark_corner": "none"}
-    monkeypatch.setattr(SEL, "verify_clip", lambda *a, **k: second or good)
+    _patch(monkeypatch, "verify_clip", lambda *a, **k: second or good)
     return sel, sh, proj, made
 
 
@@ -340,7 +359,7 @@ def _reuse_case(tmp_path, monkeypatch, starts=(0.0, 70.0), verdict=None, extra_u
     import cv2
     import numpy as np
     import ytauto.review as RV
-    import ytauto.select as SEL
+    SEL = _MODS
     shots = [Shot(id=i, segment=i, start=st, end=st + 4.0, text=f"line {i}", brief=Brief(subject="reef", setting="Philippines"))
              for i, st in enumerate(starts)]
     sel, proj = _sel(tmp_path, shots)
@@ -360,10 +379,10 @@ def _reuse_case(tmp_path, monkeypatch, starts=(0.0, 70.0), verdict=None, extra_u
     sel._index = type("Idx", (), {"clip": Clip()})()
     monkeypatch.setattr(RV, "frame_of", lambda p: object())
     made = []
-    monkeypatch.setattr(SEL, "cut_clip", lambda s, src, a, want, out, avail=None, crop=None: made.append(out) or out.write_bytes(b"x"))
-    monkeypatch.setattr(SEL, "probe", lambda p: MediaInfo(width=1920, height=1080, duration=5.0, fps=30, has_audio=False, codec="h264"))
-    monkeypatch.setattr(SEL, "run_checks", lambda p: CheckResult(blur=300, saturation=0.4, n_frames=3))
-    monkeypatch.setattr(SEL, "verify_clip", lambda *a, **k: verdict or dict(GOOD))
+    _patch(monkeypatch, "cut_clip", lambda s, src, a, want, out, avail=None, crop=None: made.append(out) or out.write_bytes(b"x"))
+    _patch(monkeypatch, "probe", lambda p: MediaInfo(width=1920, height=1080, duration=5.0, fps=30, has_audio=False, codec="h264"))
+    _patch(monkeypatch, "run_checks", lambda p: CheckResult(blur=300, saturation=0.4, n_frames=3))
+    _patch(monkeypatch, "verify_clip", lambda *a, **k: verdict or dict(GOOD))
     return sel, shots, proj, made
 
 
@@ -437,18 +456,18 @@ def test_still_queries_start_with_the_place(tmp_path, monkeypatch):
 
 # --- the judge is not asked about clips the free checks already reject ---------------------------
 def _try_case(tmp_path, monkeypatch, blur):
-    import ytauto.select as SEL
+    SEL = _MODS
     sh = Shot(id=1, segment=0, start=0, end=4, text="x", brief=Brief(subject="reef", setting="Philippines"))
     sel, proj = _sel(tmp_path, [sh])
     sel.gem = object()
     calls = []
     info = MediaInfo(width=1920, height=1080, duration=30.0, fps=30, has_audio=False, codec="h264")
-    monkeypatch.setattr(SEL, "probe", lambda p: info)
-    monkeypatch.setattr(SEL, "best_window", lambda *a, **k: (2.0, 9.0, True))
-    monkeypatch.setattr(SEL, "cut_clip", lambda s, src, a, want, out, avail=None, crop=None: out.write_bytes(b"x"))
-    monkeypatch.setattr(SEL, "run_checks", lambda p: CheckResult(blur=blur, saturation=0.4, n_frames=3))
+    _patch(monkeypatch, "probe", lambda p: info)
+    _patch(monkeypatch, "best_window", lambda *a, **k: (2.0, 9.0, True))
+    _patch(monkeypatch, "cut_clip", lambda s, src, a, want, out, avail=None, crop=None: out.write_bytes(b"x"))
+    _patch(monkeypatch, "run_checks", lambda p: CheckResult(blur=blur, saturation=0.4, n_frames=3))
     monkeypatch.setattr(SEL.overlay, "available", lambda: False)
-    monkeypatch.setattr(SEL, "verify_clip", lambda *a, **k: calls.append(1) or dict(GOOD))
+    _patch(monkeypatch, "verify_clip", lambda *a, **k: calls.append(1) or dict(GOOD))
     c = Candidate(provider="pexels", source_id="p", url="u")
     d, _ = sel._try_file(sh, c, tmp_path / "src.mp4", None, 80.0, 0.0)
     return d, calls

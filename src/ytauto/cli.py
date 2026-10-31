@@ -340,3 +340,41 @@ def review_shots(project: Path = typer.Argument(..., help="A project folder (pro
         typer.echo(f"  shot {r['shot']:3} match={r['match']:3}  {r['narration'][:60]!r}: {r['why']}")
     if weak or unrated:
         raise typer.Exit(1)
+
+
+@app.command("film")
+def film_cmd(project: Path = typer.Argument(..., help="A finished project folder (projects/<slug>) made with --vo"),
+             out: Path = typer.Option(..., help="public/<slug> of the Remotion project: clips/ (from export-remotion --out <this>/clips) "
+                                                "and vo.mp3 are read here, film.json is written here"),
+             title: str = typer.Option(..., help="Film title (title card, and the context for the AI)"),
+             audio_dir: Optional[Path] = typer.Option(None, help="Shared sound-effect folder inside public/ (<name>.mp3 files): "
+                                                                 "plans the sound and writes it into film.json"),
+             next_video: Optional[str] = typer.Option(None, "--next", help="Title of the next video for the end card; no end card without it"),
+             no_title: bool = typer.Option(False, help="No title card"),
+             music: Optional[str] = typer.Option(None, help="Music file name inside <out> (optional)"),
+             config: Optional[Path] = None):
+    """Write `film.json` for the reusable DocFilm composition: camera moves, transitions, chapters, stat cards,
+    place chips, captions' words and the sound plan, so a new film needs no new Remotion code."""
+    from . import film as F
+    from . import sfx
+    from .inspect.probe import probe
+    from .models import Segment
+
+    s = load_settings(config)
+    segs = [Segment(**d) for d in json.loads((project / "metadata" / "aligned_segments.json").read_text(encoding="utf-8"))]
+    clips = out / "clips"
+    shots = json.loads((clips / "shots.json").read_text(encoding="utf-8"))
+    words = json.loads((clips / "words.json").read_text(encoding="utf-8"))
+    vo = out / "vo.mp3"
+    info = probe(vo)
+    seconds = info.duration if info else segs[-1].end
+    gem = make_judge(s, Cache(s.cache_dir))
+    facts = F.extract_facts(gem, segs, title, seconds)
+    film = F.build(slug=out.name, title=title, segments=segs, shots=shots, words=words, seconds=seconds, facts=facts,
+                   fps=s.fps, next_video=next_video, show_title=not no_title, music=music)
+    if audio_dir is not None:
+        plan = sfx.plan(film["events"], vo, audio_dir, film["seconds"] + film["tail"], cuts=[x["t0"] for x in film["shots"]])
+        film["sfx"], film["audioBase"] = plan, audio_dir.name
+    path = F.write(film, out / "film.json")
+    typer.echo(f"{path}: {len(film['shots'])} shots, {len(film['chapters'])} chapters, {len(film['stats'])} stat cards, "
+               f"{len(film['places'])} place chips, {len(film['sfx']['cues']) if film['sfx'] else 0} sound cues")

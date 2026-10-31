@@ -263,21 +263,6 @@ def test_direct_link_gets_the_frame_grid_not_inline_video(monkeypatch, tmp_path)
     assert seen["images"] == [b"\x00\x00\x00"] and "PROMPT" in seen["prompt"] and "frames" in seen["prompt"]
 
 
-def test_inline_video_can_be_switched_back_on(monkeypatch, tmp_path):
-    monkeypatch.setattr(ProviderConfig, "load", classmethod(lambda cls, p=None: cls({})))
-    monkeypatch.setenv("GEMINI_API_KEY", "k")
-    monkeypatch.setattr(R, "extract_grid_data_url", lambda *a, **k: "data:image/jpeg;base64,AAAA")
-
-    class G:
-        def json_video_file(self, *a, **k):
-            return {"video": True}
-
-    chain = [JudgeLink(provider="_direct", model="m", vision=True)]
-    j = R.Judge(Settings(judge_chain=chain, cache_dir=tmp_path, direct_verify_video=True), Cache(tmp_path))
-    monkeypatch.setattr(j, "_direct_client", lambda: G())
-    assert j.json_video_file(tmp_path / "c.mp4", "P", SCHEMA) == {"video": True}
-
-
 # --- channel reputation --------------------------------------------------------
 def _cand(v, ch="chan"):
     return Candidate(provider="youtube", source_id=v, url="u", channel=ch)

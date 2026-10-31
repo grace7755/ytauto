@@ -107,9 +107,6 @@ class Settings(BaseModel):
     judge_concurrency: int = 4        # max judge calls in flight at once, across all threads
     # seconds before a slow judge call is hedged with the next link (first answer wins); 0 = off
     judge_hedge_after: float = 0.0
-    # True = send the native Gemini link the clip as inline video (the old behaviour, slower and
-    # spikier); False = the same tiled frame grid every other link gets
-    direct_verify_video: bool = False
     # reject a clip whose text stays pinned in place over moving footage, found by local OCR
     # (inspect/overlay.py); needs the optional rapidocr-onnxruntime package, off without it
     local_overlay_check: bool = True
