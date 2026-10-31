@@ -810,7 +810,9 @@ class Selector(LastResort):
         # nothing passed: promote the best soft-failure as a clearly flagged weak match
         best = [x for x in best if x.clip_path and Path(x.clip_path).exists()]
         while best:
-            top = max(best, key=lambda x: x.score.total if x.score else 0)
+            # The most RELEVANT soft-failure, then the best overall: ranking on the total alone picked a lovely
+            # mountain road (relevance 0, quality 95) for a sentence about a pistol on the 5 Guns film
+            top = max(best, key=lambda x: (x.score.relevance, x.score.total) if x.score else (0, 0))
             if self._ai_flagged(shot, top):
                 best.remove(top)
                 continue

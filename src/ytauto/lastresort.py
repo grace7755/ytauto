@@ -158,10 +158,13 @@ class LastResort:
             try:
                 log.info("shot %d: nothing new fits; reusing shot %d's footage (CLIP %.2f, %.0f s apart)", shot.id, d.shot, sim, gap)
                 info = probe(Path(d.clip_path))
-                if not info or info.duration < want * 0.87:
+                # an earlier shot's clip is exactly that shot's length: a longer shot cannot be cut from it, and
+                # stretching it to fit failed on the real run ("clip still short after stretch"), so only a clip
+                # at least as long as this shot (within 0.1 s) is reused
+                if not info or info.duration < want - 0.1:
                     continue
                 with stage("reuse cut"):
-                    cut_clip(self.s, Path(d.clip_path), 0.0, want, out, avail=None if info.duration >= want else info.duration)
+                    cut_clip(self.s, Path(d.clip_path), 0.0, want, out)
                 got = self._judge_made_clip(
                     shot, c, out, (d.src_start, d.src_end),
                     lambda: verify_clip(self.gem, out, shot, f"{d.provider}:{d.source_id}:{int(d.src_start)}:reuse:{shot.id}", self.s.min_relevance),

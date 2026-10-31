@@ -136,3 +136,12 @@ def test_a_film_is_refused_when_clips_are_missing_or_shots_leave_a_gap(tmp_path)
     assert F.check_complete(2, rows, tmp_path) == ["b.mp4 is missing from " + str(tmp_path)]
     gap = [rows[0], {"id": "s01", "clip": "a.mp4", "t0": 4.5, "t1": 8.0}]
     assert "s00 ends at 4.0s but s01 starts at 4.5s" in F.check_complete(2, gap, tmp_path)[0]
+
+
+def test_a_currency_sign_goes_in_front_of_the_number_and_a_two_word_place_line_is_dropped():
+    segs = [Segment(idx=0, start=0, end=8, text="It costs less than $500."), Segment(idx=1, start=8, end=20, text="It is built in Carroll, Iowa.")]
+    facts = F.check_facts({"stats": [{"segment": 0, "say": "$500", "big": "500", "unit": "$", "label": "price"}],
+                           "places": [{"segment": 1, "name": "Carroll Iowa", "sub": "built in"}]}, segs, "Guns")
+    stats, places, _ = F.place_cards(facts, segs, [], 30.0)
+    assert (stats[0]["big"], stats[0]["unit"]) == ("$500", "")
+    assert places[0]["sub"] == "" and places[0]["name"] == "CARROLL IOWA"

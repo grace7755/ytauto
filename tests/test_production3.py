@@ -532,3 +532,29 @@ def test_the_budget_counts_from_the_start_of_each_select_so_redo_works(tmp_path,
     sel._stock = lambda shot, best: None
     sel.select(sh)
     assert seen == [False], "4 old rejects must not use up the budget of a new select"
+
+
+def test_a_clip_shorter_than_the_new_shot_is_not_reused(tmp_path, monkeypatch):
+    import ytauto.lastresort as LR
+    sel, shots, proj, made = _reuse_case(tmp_path, monkeypatch)
+    short = MediaInfo(width=1920, height=1080, duration=3.5, fps=30, has_audio=False, codec="h264")    # shot 1 wants 4.0 s
+    _patch(monkeypatch, "probe", lambda p: short)
+    assert sel._reuse(shots[1]) is None and made == []
+
+
+def test_the_weak_match_is_the_most_relevant_candidate_not_the_prettiest(tmp_path):
+    from ytauto.models import ClipScore
+    sh = Shot(id=0, segment=0, start=0, end=4, text="a pistol", brief=Brief(subject="pistol"))
+    sel, proj = _sel(tmp_path, [sh])
+    for name, rel, total in (("road", 0, 80), ("gun", 45, 64)):
+        f = tmp_path / f"{name}.mp4"
+        f.write_bytes(b"x")
+    best = [Decision(shot=0, status="rejected", provider="pexels", source_id="road", url="u", clip_path=str(tmp_path / "road.mp4"),
+                     score=ClipScore(relevance=0, total=80)),
+            Decision(shot=0, status="rejected", provider="pexels", source_id="gun", url="u", clip_path=str(tmp_path / "gun.mp4"),
+                     score=ClipScore(relevance=45, total=64))]
+    sel._sibling = sel._from_library = sel._crop_logo = sel._still = sel._reuse = lambda *a, **k: None
+    sel._youtube = lambda shot, b: b.extend(best)
+    sel._stock = lambda shot, b: None
+    got = sel.select(sh)
+    assert got.status == "weak" and got.source_id == "gun"

@@ -32,6 +32,7 @@ TRANSITIONS = ["fade", "cut", "fade", "zoom", "fade", "cut", "dip", "fade"]
 CHAPTER_SNAP = 0.9           # a shot starting this close to a chapter time opens that chapter
 MIN_CHAPTER_GAP = 20.0
 STAT_SECONDS, PLACE_SECONDS, TITLE_SECONDS = 5.0, 7.0, 5.1
+CURRENCY = {"$", "€", "£"}
 STAT_MIN_GAP = 3.0           # a second card closer than this to the previous one is dropped
 STAT_SIDE_GAP = 5.0          # closer than this (but >= STAT_MIN_GAP): the second card goes on the other side
 
@@ -168,7 +169,10 @@ def place_cards(facts: dict, segments: list[Segment], words: list[dict], seconds
                 if stats[-1]["side"] == "right":
                     continue                              # two cards are already on screen
                 side = "right"
-        stats.append({"at": round(at, 2), "to": round(at + STAT_SECONDS, 2), "big": str(st["big"]), "unit": st.get("unit") or "",
+        big, unit = str(st["big"]), (st.get("unit") or "")
+        if unit.strip() in CURRENCY:          # "$" after the number reads "500$": a currency sign goes in front
+            big, unit = unit.strip() + big, ""
+        stats.append({"at": round(at, 2), "to": round(at + STAT_SECONDS, 2), "big": big, "unit": unit,
                       "label": str(st["label"]).upper(), "side": side, "major": bool(st.get("major"))})
     places: list[dict] = []
     for p in sorted(facts.get("places", []), key=lambda p: by_idx[p["segment"]].start):
@@ -176,7 +180,9 @@ def place_cards(facts: dict, segments: list[Segment], words: list[dict], seconds
         if places and at - places[-1]["at"] < PLACE_SECONDS:
             continue
         places.append({"at": round(at, 2), "to": round(min(at + PLACE_SECONDS, seconds), 2),
-                       "name": str(p["name"]).upper(), "sub": str(p.get("sub") or "")})
+                       "name": str(p["name"]).upper(),
+                       # a one- or two-word line ("built in", "based in") says nothing: show the name alone
+                       "sub": str(p.get("sub") or "") if len(str(p.get("sub") or "").split()) >= 3 else ""})
     return stats, places, chapters
 
 
