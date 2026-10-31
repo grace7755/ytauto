@@ -251,3 +251,49 @@ def test_a_failed_section_download_is_retried_once(tmp_path, monkeypatch):
     (tmp_path / "v_000000_000100.mp4").unlink()
     monkeypatch.setattr(DL, "download", lambda self, urls: (attempts.append(1), 1 / 0)[1])
     assert yt.download_section(c, 1.5, 8.5, tmp_path, pad=1.5) is None and len(attempts) == 2, "gives up after one retry"
+
+
+# --- storyboard_face_check: a presenter-sized face in a tile only reorders --------------------
+def _coloured_sheet(n=10):
+    from PIL import Image
+    from ytauto.sources import storyboard as SB
+
+    tiles = [(float(i * 10), Image.new("RGB", (160, 90), (i * 20, 255 - i * 20, 80))) for i in range(n)]
+    data, times = SB._contact_sheet(tiles)
+    return SB.Storyboard("v", data, times, 10.0, n * 10.0)
+
+
+def test_tile_is_cut_back_out_of_the_contact_sheet():
+    sb = _coloured_sheet()
+    t3 = sb.tile(3)
+    assert t3.shape[:2] == (135, 240)
+    b, g, r = t3[60:, 60:].reshape(-1, 3).mean(axis=0)          # below the number label
+    assert abs(r - 60) < 12 and abs(g - 195) < 12
+    assert sb.tile(99) is None
+    assert sb.nearest_tile(31) == 3
+
+
+def test_face_tiles_go_last_and_an_all_face_video_is_held_back(monkeypatch):
+    from ytauto import screen as S
+
+    sb = _coloured_sheet()
+    monkeypatch.setattr(S, "_tile_face", lambda sb, tile, limit: tile in (2, 5))
+    data = {"usable": True, "match": 90, "tiles": [2, 4, 5]}
+    r = S._sb_result(data, sb, face_limit=0.12)
+    assert [w["description"] for w in r["windows"]] == ["storyboard tile 4", "storyboard tile 2", "storyboard tile 5"]
+    assert r["usable"] and not r["face_suspect"], "a reorder, never a reject"
+    assert S._sb_result({"usable": True, "match": 90, "tiles": [2, 5]}, sb, 0.12)["face_suspect"]
+
+
+def test_face_check_is_off_unless_configured(monkeypatch):
+    from ytauto import screen as S
+    from ytauto.config import Settings
+
+    class G:
+        s = Settings()
+    assert S._face_check(G()) is None
+    G.s = Settings(storyboard_face_check=True)
+    assert S._face_check(G()) == G.s.max_face_ratio
+    monkeypatch.setattr(S, "_tile_face", lambda *a: (_ for _ in ()).throw(AssertionError("ran while off")))
+    r = S._sb_result({"usable": True, "match": 90, "tiles": [1]}, _coloured_sheet(), None)
+    assert r["windows"][0]["face"] is False

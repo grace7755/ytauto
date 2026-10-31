@@ -133,6 +133,10 @@ class Settings(BaseModel):
     # judge links at the head of the chain used side by side (least expected wait first) instead
     # of strictly in order; 1 = plain chain order
     judge_lanes: int = 2
+    # local face check on the storyboard tiles the judge picked: a presenter-sized face only moves a tile /
+    # video to the back of the queue (never rejects). Off until measured on your ledgers:
+    # scripts/measure_face_tiles.py
+    storyboard_face_check: bool = False
     # a judge link whose requests-per-minute bucket would make a call wait longer than this many seconds
     # is skipped for the next live link; the call only waits when every link is busy. 0 = always wait
     judge_spill_after: float = 3.0

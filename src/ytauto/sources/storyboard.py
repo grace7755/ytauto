@@ -53,6 +53,27 @@ class Storyboard:
         t = self.times[tile]
         return max(0.0, t - 2.0), min(self.duration, t + min(max(self.step, MIN_AHEAD), max_len))
 
+    def tile(self, i: int):
+        """Tile `i` cut back out of the contact sheet, as a BGR array (None if out of range)."""
+        import cv2
+        import numpy as np
+
+        if not 0 <= i < len(self.times):
+            return None
+        sheet = self.__dict__.get("_sheet")
+        if sheet is None:
+            sheet = cv2.imdecode(np.frombuffer(self.jpeg, np.uint8), cv2.IMREAD_COLOR)
+            self.__dict__["_sheet"] = sheet
+        if sheet is None:
+            return None
+        rows = -(-len(self.times) // SHEET_COLS)
+        w, h = sheet.shape[1] // SHEET_COLS, sheet.shape[0] // rows
+        x, y = (i % SHEET_COLS) * w, (i // SHEET_COLS) * h
+        return sheet[y:y + h, x:x + w]
+
+    def nearest_tile(self, t: float) -> int:
+        return min(range(len(self.times)), key=lambda i: abs(self.times[i] - t))
+
 
 def spec_from_info(info: dict) -> dict | None:
     """The highest-resolution storyboard format from a yt-dlp info dict, in a cacheable form."""

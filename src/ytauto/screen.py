@@ -163,14 +163,35 @@ def _tiles(raw) -> list[int]:
     return out
 
 
-def _sb_result(data: dict, sb: Storyboard) -> dict:
+TILE_FACE_MIN = 24     # px: a presenter-sized face (12% of the frame) is ~60 px wide in a 240x135 tile
+
+
+def _face_check(gem) -> float | None:
+    """`max_face_ratio` when `storyboard_face_check` is on, else None."""
+    s = getattr(gem, "s", None)
+    return s.max_face_ratio if s is not None and getattr(s, "storyboard_face_check", False) else None
+
+
+def _tile_face(sb: Storyboard, tile: int, limit: float) -> bool:
+    """Does this thumbnail show a presenter-sized face? Free (local Haar on the cached sheet)."""
+    from .inspect.checks import largest_face_ratio
+
+    im = sb.tile(tile)
+    return im is not None and largest_face_ratio([im], TILE_FACE_MIN) > limit
+
+
+def _sb_result(data: dict, sb: Storyboard, face_limit: float | None = None) -> dict:
     """Map a storyboard verdict (tile numbers) to the screening result shape (windows in seconds).
 
     `overlay_tiles` is a soft signal only: thumbnails are ~160 px wide, too small to rule on a
     watermark (verify and the benchmark do that on the full-resolution clip). It only reorders -
     clean tiles are downloaded first, and a video whose every tile is flagged is `overlay_suspect`,
     tried after the round's clean candidates. Measured: 12 of 30 downloads in a 12-shot run were
-    rejected for a watermark or burnt-in text that screening never looked for."""
+    rejected for a watermark or burnt-in text that screening never looked for.
+
+    `face_limit` (`storyboard_face_check`): a tile with a presenter-sized face is tried last and a
+    video whose every tile has one is `face_suspect`, held back like `overlay_suspect`. Also only a
+    reorder: the face check on the downloaded clip and the judge's `presenter_on_camera` decide."""
     try:
         best = int(float(data.get("match", 0) or 0))
     except (ValueError, TypeError):
@@ -184,10 +205,12 @@ def _sb_result(data: dict, sb: Storyboard) -> dict:
         seen.add(tile)
         # keep the judge's best-first order; later tiles rank a little lower
         wins.append({"start": win[0], "end": win[1], "match": max(0, best - 3 * k),
-                     "description": f"storyboard tile {tile}", "overlay": tile in flagged})
-    wins.sort(key=lambda w: w["overlay"])         # stable: clean tiles first, judge order kept
+                     "description": f"storyboard tile {tile}", "overlay": tile in flagged,
+                     "face": face_limit is not None and _tile_face(sb, tile, face_limit)})
+    wins.sort(key=lambda w: (w["overlay"], w["face"]))   # stable: clean tiles first, judge order kept
     return {"usable": bool(data.get("usable")), "reason": data.get("reason", ""), "windows": wins,
             "overlay_suspect": bool(wins) and all(w["overlay"] for w in wins),
+            "face_suspect": bool(wins) and all(w["face"] for w in wins),
             "presenter_on_camera": bool(data.get("presenter_on_camera")),
             "black_and_white": bool(data.get("black_and_white")),
             "ai_or_animated": False, "watermark_or_logo": False, "looks_dated": False,
@@ -256,7 +279,7 @@ def screen_storyboards(gem: Judge, cands: list[Candidate], shot: Shot, sbs: list
     for i, (c, sb) in enumerate(zip(cands, sbs)):
         hit = gem.cache.get("judge", *_sb_cache_key(c, shot)) if getattr(gem, "cache", None) else None
         if hit is not None:
-            out[i] = _sb_result(hit, sb)
+            out[i] = _sb_result(hit, sb, _face_check(gem))
         else:
             todo.append(i)
     if len(todo) == 1:
@@ -288,7 +311,7 @@ def screen_storyboards(gem: Judge, cands: list[Candidate], shot: Shot, sbs: list
             continue
         if getattr(gem, "cache", None):
             gem.cache.set("judge", v, *_sb_cache_key(cands[i], shot))
-        out[i] = _sb_result(v, sbs[i])
+        out[i] = _sb_result(v, sbs[i], _face_check(gem))
     return out
 
 
@@ -310,7 +333,7 @@ def screen_storyboard(gem: Judge, c: Candidate, shot: Shot, sb: Storyboard) -> d
     except Exception as e:
         log.warning("storyboard screening failed for %s: %s", c.url, str(e)[:200])
         return None
-    return _sb_result(data, sb)
+    return _sb_result(data, sb, _face_check(gem))
 
 
 def screen(gem: Judge, c: Candidate, shot: Shot, fps: float = 1.0, *, yt=None,

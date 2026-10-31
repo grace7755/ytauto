@@ -110,14 +110,16 @@ def static_overlay_corners(frames) -> float:
     return min(1.0, max(fracs) * 6)
 
 
-def largest_face_ratio(frames) -> float:
+def largest_face_ratio(frames, min_size: int = 60) -> float:
+    """Largest frontal face as a share of the frame. `min_size` 60 px suits 1080p frames; storyboard
+    tiles (240x135) need ~24 px, where a presenter-sized face (12% of the frame) is ~60 px wide."""
     global _FACE
     if _FACE is None:
         _FACE = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
     best = 0.0
     for f in frames:
         g = cv2.cvtColor(f, cv2.COLOR_BGR2GRAY)
-        faces = _FACE.detectMultiScale(g, scaleFactor=1.1, minNeighbors=6, minSize=(60, 60))
+        faces = _FACE.detectMultiScale(g, scaleFactor=1.1, minNeighbors=6, minSize=(min_size, min_size))
         for (_, _, w, h) in faces:
             best = max(best, (w * h) / (g.shape[0] * g.shape[1]))
     return float(best)

@@ -433,7 +433,7 @@ class Selector(LastResort):
         is a deferral, never a reject: thumbnails are too small to rule on a watermark."""
         held, low = [], []
         for c, r in self._screened(shot, ready):
-            if isinstance(r, dict) and r.get("usable") and r.get("overlay_suspect"):
+            if isinstance(r, dict) and r.get("usable") and (r.get("overlay_suspect") or r.get("face_suspect")):
                 held.append((c, r))
                 continue
             if isinstance(r, dict) and r.get("usable") and self._low_match(r):
@@ -441,7 +441,7 @@ class Selector(LastResort):
                 continue
             yield c, r
         if held:
-            log.info("shot %d: trying %d candidate(s) whose thumbnails all show text or a logo",
+            log.info("shot %d: trying %d candidate(s) whose thumbnails all show text, a logo or a large face",
                      shot.id, len(held))
         yield from held
         if low:
@@ -510,7 +510,7 @@ class Selector(LastResort):
             r = results.get(c.source_id)
             if not isinstance(r, dict) or not r.get("usable") or not r.get("windows"):
                 continue
-            if r.get("overlay_suspect") or any(r.get(k) for k in BAD_FLAGS) or self.bad_video(c) or self._low_match(r):
+            if r.get("overlay_suspect") or r.get("face_suspect") or any(r.get(k) for k in BAD_FLAGS) or self.bad_video(c) or self._low_match(r):
                 continue
             w = next(((x["start"], x["end"]) for x in r["windows"]
                       if f"youtube:{c.source_id}:{x['start']:.0f}" not in tried
