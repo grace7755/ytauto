@@ -16,6 +16,7 @@ import time
 from collections import deque
 from datetime import datetime, timedelta, timezone
 
+from .. import timing
 from ..cache import Cache
 from ..config import JudgeLink
 
@@ -86,9 +87,13 @@ class Quota:
         return until
 
     # -- per request -----------------------------------------------------------
-    def acquire(self, link: JudgeLink) -> bool:
+    def acquire(self, link: JudgeLink, max_wait: float | None = None) -> bool | None:
         """Count one request against the link. False (and nothing counted) if the daily cap is
-        reached; otherwise block as needed to stay under `rpm`, then return True."""
+        reached; otherwise block as needed to stay under `rpm`, then return True.
+
+        `max_wait`: when the per-minute bucket would make this call wait longer than that, return
+        None at once (nothing counted) so the caller can use another link instead of sleeping. The
+        chain spills that way (`judge_spill_after`); a blocking wait is timed as "judge wait"."""
         tag = self.tag(link)
         while True:
             with self._lock:
@@ -104,7 +109,10 @@ class Quota:
                     self.cache.set("quota_used", self.used(link) + 1, tag, day)
                     return True
                 wait = q[0] + 60 - now
-            self.sleep(max(0.05, wait))
+            if max_wait is not None and wait > max_wait:
+                return None
+            with timing.stage("judge wait"):
+                self.sleep(max(0.05, wait))
 
     def status(self, links: list[JudgeLink]) -> list[dict]:
         out = []

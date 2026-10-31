@@ -21,6 +21,7 @@ import urllib.request
 from pathlib import Path
 
 from ..cache import Cache
+from .. import timing
 from ..config import JudgeLink, Settings
 from ..inspect.grid import extract_grid_data_url, grid_hint
 from ..log import log
@@ -336,10 +337,14 @@ class Judge:
         return text
 
     def _send(self, link: JudgeLink, content: list[dict], schema: dict | None,
-              timeout: float = TIMEOUT) -> str | None:
+              timeout: float = TIMEOUT, max_wait: float | None = None, busy: list | None = None) -> str | None:
         """`_post` behind the daily counter, the per-minute bucket and the in-flight cap.
-        None means the link's daily cap is reached and nothing was sent."""
-        if not self.quota.acquire(link):
+        None means nothing was sent: the link's daily cap is reached, or its minute bucket would
+        wait longer than `max_wait` (then the link is added to `busy`)."""
+        ok = self.quota.acquire(link, max_wait)
+        if ok is None and busy is not None:
+            busy.append(link)
+        if not ok:
             return None
         with self._slots:
             return self._post(link, content, schema, timeout)
@@ -362,6 +367,11 @@ class Judge:
         """
         last: Exception | None = None
         patience = self.s.judge_patience
+        # First walk: a link whose per-minute bucket is full is skipped (the call goes to the next
+        # live link) instead of sleeping; only when no other link answers do we wait for a busy one.
+        # Before, calls slept on the first links' 15/min buckets while later links sat idle.
+        spill = self.s.judge_spill_after if self.s.judge_spill_after > 0 else None
+        mode = {"max_wait": spill, "busy": []}
 
         def try_link(link: JudgeLink) -> dict | None:
             """One link's answer; None = skipped without a call (daily cap, no direct client)."""
@@ -378,7 +388,10 @@ class Judge:
             if link.provider == DIRECT:
                 if direct is None or self._direct_failed:
                     return None
-                if not self.quota.acquire(link):
+                ok = self.quota.acquire(link, mode["max_wait"])
+                if ok is None:
+                    mode["busy"].append(link)
+                if not ok:
                     return None
                 with self._slots:
                     t0 = time.time()
@@ -387,18 +400,28 @@ class Judge:
                 self.calls += 1
                 return data
             t0 = time.time()
-            reply = self._send(link, content_for(link), schema, timeout)
+            reply = self._send(link, content_for(link), schema, timeout, mode["max_wait"], mode["busy"])
             if reply is None:
-                return None                            # daily cap reached: not a failure
+                return None                            # daily cap / minute bucket busy: not a failure
             self._note_latency(link, time.time() - t0)
             return _extract_json(reply)
 
         for attempt in range(2):
+            mode["max_wait"], mode["busy"] = spill, []
             data, err = self._walk(self._lanes(self._live(need_vision=need_vision, need_youtube=need_youtube)),
                                    try_link)
             if data is not None:
                 return data
             last = err or last
+            if mode["busy"]:                           # nothing else answered: now wait for a busy link
+                with timing.stage("judge spill: all links busy"):
+                    pass
+                mode["max_wait"] = None
+                busy = list({self._tag(l): l for l in mode["busy"]}.values())
+                data, err = self._walk(busy, try_link)
+                if data is not None:
+                    return data
+                last = err or last
             if self.out_of_quota(need_vision=need_vision, need_youtube=need_youtube):
                 self._raise_quota(need_vision, need_youtube)
             if attempt == 0 and patience > 0 and self._recoverable(need_vision, need_youtube):

@@ -133,6 +133,9 @@ class Settings(BaseModel):
     # judge links at the head of the chain used side by side (least expected wait first) instead
     # of strictly in order; 1 = plain chain order
     judge_lanes: int = 2
+    # a judge link whose requests-per-minute bucket would make a call wait longer than this many seconds
+    # is skipped for the next live link; the call only waits when every link is busy. 0 = always wait
+    judge_spill_after: float = 3.0
     # copy every accepted clip into a shared library (`<cache_dir>/library`) and search it with
     # CLIP before YouTube; a library clip skips search, screening and download, never the checks
     library: bool = True

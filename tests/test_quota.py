@@ -229,3 +229,60 @@ def test_chain_mode_gemini_does_not_sleep_on_a_demand_spike(monkeypatch):
     with pytest.raises(GM.GeminiError):
         g._generate_one("m", [], None, 2)
     assert len(calls) == 1, "straight on to the next chain link, no second attempt"
+
+
+# --- spill: a full per-minute bucket moves the call on instead of sleeping -----------------
+def test_acquire_with_max_wait_returns_none_instead_of_sleeping(tmp_path):
+    clock = Clock(_ts(2026, 7, 1, 12, 0))
+    q = Q.Quota(Cache(tmp_path), clock=clock, sleep=clock.sleep)
+    link = JudgeLink(provider="p", model="m", rpm=2)
+    assert q.acquire(link, max_wait=3) and q.acquire(link, max_wait=3)
+    t = clock.t
+    assert q.acquire(link, max_wait=3) is None, "bucket full: hand the call to another link"
+    assert clock.t == t, "and do not sleep"
+    assert q.used(link) == 2, "a skipped call is not counted"
+    assert q.acquire(link) is True and clock.t >= t + 60, "without max_wait it still waits, as before"
+
+
+def _spill_judge(monkeypatch, tmp_path, chain, **kw):
+    j = _judge(monkeypatch, tmp_path, chain, judge_lanes=1, **kw)
+    clock = Clock(_ts(2026, 7, 1, 12, 0))
+    j.quota = Q.Quota(Cache(tmp_path), clock=clock, sleep=clock.sleep)
+    return j, clock
+
+
+def test_a_busy_link_spills_to_the_next_live_link_without_waiting(monkeypatch, tmp_path):
+    a = JudgeLink(provider="g", model="gemini-a", vision=True, rpm=2)
+    b = JudgeLink(provider="zai", model="b", vision=True)
+    j, clock = _spill_judge(monkeypatch, tmp_path, [a, b])
+    asked = []
+    monkeypatch.setattr(j, "_post", lambda link, *x, **k: asked.append(link.model) or '{"ok": true}')
+    t = clock.t
+    for _ in range(4):
+        j.json("p", SCHEMA)
+    assert asked == ["gemini-a", "gemini-a", "b", "b"]
+    assert clock.t == t, "nothing slept while another link was free"
+
+
+def test_the_call_waits_only_when_every_link_is_busy(monkeypatch, tmp_path):
+    a = JudgeLink(provider="g", model="gemini-a", vision=True, rpm=1)
+    b = JudgeLink(provider="zai", model="b", vision=True, rpm=1)
+    j, clock = _spill_judge(monkeypatch, tmp_path, [a, b])
+    asked = []
+    monkeypatch.setattr(j, "_post", lambda link, *x, **k: asked.append(link.model) or '{"ok": true}')
+    t = clock.t
+    for _ in range(3):
+        j.json("p", SCHEMA)
+    assert asked == ["gemini-a", "b", "gemini-a"], "both full: wait for the first link in chain order"
+    assert clock.t >= t + 60
+
+
+def test_spill_off_keeps_the_old_blocking_behaviour(monkeypatch, tmp_path):
+    a = JudgeLink(provider="g", model="gemini-a", vision=True, rpm=1)
+    b = JudgeLink(provider="zai", model="b", vision=True)
+    j, clock = _spill_judge(monkeypatch, tmp_path, [a, b], judge_spill_after=0)
+    asked = []
+    monkeypatch.setattr(j, "_post", lambda link, *x, **k: asked.append(link.model) or '{"ok": true}')
+    for _ in range(2):
+        j.json("p", SCHEMA)
+    assert asked == ["gemini-a", "gemini-a"]
