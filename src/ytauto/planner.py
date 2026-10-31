@@ -74,6 +74,10 @@ Return one entry per shot in `shots` (keep id):
 - youtube_queries: {nq} distinct YouTube search queries likely to surface high-quality real footage with no presenter
   (prefer wording such as "4K", "drone", "walking tour", "cinematic b-roll", "timelapse"; mix wide and detail angles).
   At least half of them must name the main subject itself, not only the area around it.
+  For an object or product (a gun, a car, a tool, a gadget), aim at footage of the thing itself:
+  "<name> b-roll", "<name> slow motion", "<name> close up 4k", "<name> shooting range footage",
+  "<name> factory production line". Never use words that surface people talking about it: review,
+  unboxing, vs, comparison, first impressions, tutorial, how to, explained, reaction, podcast.
 - stock_queries: 2 short generic queries (2-4 words) for stock sites.
 - avoid: things that would ruin the shot (e.g. "vlogger talking to camera", "map graphic", "cartoon").
 - generic: true ONLY when the subject is ordinary b-roll that any stock-footage library has (open sea,
@@ -192,6 +196,34 @@ def primary_subject(b: Brief) -> str:
         if toks and len(hits) == len(toks) and min(hits) < pos:
             best, pos = e, min(hits)
     return best or (b.entities[0] if b.entities else "")
+
+
+# Words that make YouTube return a person talking about the subject. Measured on the 5-guns film: most
+# of 282 rejects were gun-review channels with a presenter on camera; each cost a storyboard screen or a
+# download plus a judge call. Only search wording changes - nothing about what is accepted.
+_PRESENTER_WORDS = re.compile(
+    r"\b(?:reviews?|unboxing|vs\.?|versus|comparison|first impressions?|tutorial|how to|explained|"
+    r"reaction|podcast|talk|interview|vlog)\b", re.I)
+
+
+def _b_roll_queries(briefs: dict[int, Brief]) -> list[str]:
+    """Strip presenter-style words from YouTube queries ("Glock 19 review" -> "Glock 19 b-roll")."""
+    fixed = []
+    for sid, b in briefs.items():
+        if not b or not b.youtube_queries:
+            continue
+        out = []
+        for q in b.youtube_queries:
+            if _PRESENTER_WORDS.search(q):
+                q2 = " ".join(_PRESENTER_WORDS.sub(" ", q).split())
+                q2 = f"{q2} b-roll" if q2 and "b-roll" not in q2.lower() else q2
+                fixed.append(f"{q!r} -> {q2!r}")
+                q = q2
+            if q and q.lower() not in {x.lower() for x in out}:
+                out.append(q)
+        if out != b.youtube_queries and out:
+            briefs[sid] = b.model_copy(update={"youtube_queries": out})
+    return fixed
 
 
 def _align_queries(shots: list[Shot], briefs: dict[int, Brief], nq: int) -> list[str]:
@@ -422,6 +454,9 @@ def plan(segments: list[Segment], shots: list[Shot], title: str, s: Settings, ca
     if bad:
         log.warning("planner asked for footage that cannot exist as one clip: %s; using a plain "
                     "single-shot brief instead", "; ".join(bad))
+    talk = _b_roll_queries(briefs)
+    if talk:
+        log.info("presenter-style search words removed: %s", "; ".join(talk[:10]))
     aligned = _align_queries(shots, briefs, s.queries_per_segment)
     if aligned:
         log.info("search queries re-aimed at the shot's main subject: %s", "; ".join(aligned))

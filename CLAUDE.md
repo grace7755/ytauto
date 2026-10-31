@@ -26,7 +26,7 @@ copy .env.example .env
 .venv\Scripts\ytauto run    samples\quick_test.txt --title "My Video"
 .venv\Scripts\ytauto plan   script.txt --title "My Video"      # briefs + queries only
 .venv\Scripts\ytauto status script.txt --title "My Video"
-.venv\Scripts\ytauto redo   script.txt --title "My Video" --shot 7
+.venv\Scripts\ytauto redo   script.txt --title "My Video" --shot 3,7,12   # all in one process
 .venv\Scripts\ytauto search "kyoto temples 4k"
 .venv\Scripts\ytauto quota                                     # judge requests used today, per link
 ```
@@ -222,6 +222,16 @@ record those findings.
 - Remotion side: `D:\remotion\my-video\src\doc-kit\DocFilm.tsx` (registered once in `Root.tsx` as `DocFilm`, `--props='{"slug":"<slug>"}'`).
 
 
+## Round 5: speed (31 Oct 2026)
+
+Measured baseline (5-guns film, 141 min): selection 76, 12 one-at-a-time redos 39, two Remotion renders 18.
+- `redo --shot 3,7,12` runs every shot in ONE process (one `prepare`, `shot_workers` side by side, one export, one QA) and writes `logs/timings-redo.json`.
+- `ffmpeg_render: auto` (default): with `remotion_export` set, `run`/`redo` skip the ffmpeg `final.mp4` and its QA, which the Remotion workflow never used. `qa.run_qa_clips` keeps the ledger, duplicate and contact-sheet checks on the clips. `ffmpeg_render: always` brings the old behaviour back (needed by `ytauto finish`).
+- `judge_spill_after: 3`: a link whose per-minute bucket would block longer is skipped for the next live link (`Quota.acquire(max_wait=)` returns None); a call waits only when every link is busy. Blocking waits show as `judge wait` in `timings.json`. 0 = old behaviour.
+- `storyboard_face_check` (default OFF): local Haar on the picked storyboard tiles; a face tile goes last and an all-face video is `face_suspect` (held back like `overlay_suspect`). Never a reject. Turn on only if `scripts/measure_face_tiles.py` says so on your ledgers.
+- `planner._b_roll_queries` strips presenter words (review, unboxing, vs, tutorial...) from YouTube queries; the prompt asks for b-roll wording for objects/products. Cache key stays `plan-shots-v4` so projects in progress keep their briefs.
+- Tests: `tests/test_redo_batch.py`, spill tests in `tests/test_quota.py`, face-tile tests in `tests/test_storyboard.py`.
+
 ## Working in Claude Code (moved back from Nibedita, 31 Oct 2026)
 
 **Two folders make up the system.** Run Claude Code from this folder; `.claude/settings.json` also opens `D:\remotion\my-video` (the Remotion project, own git repo, own `CLAUDE.md`) and `E:\1-MARKETING\yt-auto-test` (test films).
@@ -234,6 +244,6 @@ record those findings.
 
 **Working style the owner asked for:** reply in simple words, keep answers short, put results first, never create automation scripts without asking, use agents (not scripts) for automation, do not run before/after timing tests unless asked, check a change yourself before saying it works, and say what failed.
 
-**Known limits:** age-restricted YouTube videos are skipped (reading them needs browser cookies, `cookies_from_browser`, not enabled). `ytauto redo` takes about 4 minutes per shot. Gemini free limits (15 requests per minute) are the footage-stage ceiling.
+**Known limits:** age-restricted YouTube videos are skipped (reading them needs browser cookies, `cookies_from_browser`, not enabled). `ytauto redo` took about 4 minutes per shot when run one shot at a time; pass every shot in one `--shot 3,7,12`. Gemini free limits (15 requests per minute) are the footage-stage ceiling.
 
 **Asset library `E:\video-assets` (VFX, Lottie, SFX, music, overlays).** Read-only while making a film: look up an item in `E:\video-assets\index.json` (path, title, source, licence), then COPY the file into `D:\remotion\my-video\public\<slug>\` (or a shared `public\doc-kit-*` folder) and use it from there with `staticFile`. Never edit or move files in the library during a film. Its own rules are in `E:\video-assets\CLAUDE.md` (read it before adding anything: new downloads go to `_inbox\`, only free commercial licences, `metadata.json` is the source of truth, then `node build-index.mjs`). Light leaks come from `@remotion/light-leaks`, not from the library.
