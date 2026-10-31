@@ -68,13 +68,13 @@ def screen_url(gem: Judge, c: Candidate, shot: Shot, fps: float = 1.0) -> dict |
     """
     b = shot.brief
     prompt = PROMPT.format(subject=b.subject or b.visual, visual=b.visual,
-                           entities=", ".join(b.entities) or "-", text=shot.text,
+                           entities=b.names(), text=shot.text,
                            avoid=", ".join(b.avoid) or "-")
     # long videos: look at the first 20 min only (cost control); chapters could narrow this later
     end = min(c.duration, 1200) if c.duration > 1200 else None
     try:
         data = gem.json_youtube(c.url, prompt, SCREEN_SCHEMA, end=end, fps=fps,
-                                cache_key=("screen-v2", c.source_id, b.subject, b.visual, ",".join(b.entities)))
+                                cache_key=("screen-v2", c.source_id, b.subject, b.visual, b.key()))
     except JudgeError:
         raise                     # chain exhausted: our outage, not this candidate's fault
     except Exception as e:
@@ -150,7 +150,7 @@ on the full-resolution clip. Title cards, maps and text slides are not usable fo
 
 def _sb_cache_key(c: Candidate, shot: Shot) -> tuple:
     b = shot.brief
-    return ("screen-sb2", c.source_id, b.subject, b.visual, ",".join(b.entities))
+    return ("screen-sb2", c.source_id, b.subject, b.visual, b.key())
 
 
 def _tiles(raw) -> list[int]:
@@ -266,7 +266,7 @@ def screen_storyboards(gem: Judge, cands: list[Candidate], shot: Shot, sbs: list
     if not todo:
         return out
     prompt = BATCH_PROMPT.format(k=len(todo), last=letters[len(todo) - 1], subject=b.subject or b.visual,
-                                 visual=b.visual, entities=", ".join(b.entities) or "-", text=shot.text,
+                                 visual=b.visual, entities=b.names(), text=shot.text,
                                  avoid=", ".join(b.avoid) or "-")
     try:
         data = gem.json_images(prompt, [sbs[i].jpeg for i in todo], BATCH_SCHEMA)
@@ -301,7 +301,7 @@ def screen_storyboard(gem: Judge, c: Candidate, shot: Shot, sb: Storyboard) -> d
     """
     b = shot.brief
     prompt = SB_PROMPT.format(n=len(sb.times), step=sb.step, subject=b.subject or b.visual, visual=b.visual,
-                              entities=", ".join(b.entities) or "-", text=shot.text,
+                              entities=b.names(), text=shot.text,
                               avoid=", ".join(b.avoid) or "-")
     try:
         data = gem.json_images(prompt, [sb.jpeg], SB_SCHEMA, cache_key=_sb_cache_key(c, shot))

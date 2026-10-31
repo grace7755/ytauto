@@ -57,4 +57,4 @@ class ProviderConfig:
         return str(base).rstrip("/"), str(key)
 
     def has(self, provider: str) -> bool:
-        return provider == DIRECT or self.endpoint(provider) is not None
+        return provider in (DIRECT, "_heart") or self.endpoint(provider) is not None

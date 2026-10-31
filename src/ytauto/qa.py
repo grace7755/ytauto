@@ -32,6 +32,16 @@ class QAResult:
             self.bad_shots.add(shot)
 
 
+def _declared_reuse(proj: Project, a: int, b: int) -> bool:
+    """Is one of these two shots a deliberate reuse (`Selector._reuse`: the same clip, far apart on the
+    timeline) of the other? Anything else that looks the same is still a duplicate."""
+    da, db = proj.accepted(a), proj.accepted(b)
+    if not da or not db:
+        return False
+    same = (da.provider, da.source_id) == (db.provider, db.source_id) and abs(da.src_start - db.src_start) < 0.15
+    return same and ("REUSED footage" in da.notes or "REUSED footage" in db.notes)
+
+
 def _shot_at(shots: list[Shot], t: float) -> int | None:
     for sh in shots:
         if sh.start - 1e-3 <= t < sh.end:
@@ -108,7 +118,7 @@ def run_qa(s: Settings, proj: Project, shots: list[Shot], video: Path, expected_
     cap.release()
     for i, (ia, ha) in enumerate(hashes):
         for ib, hb in hashes[i + 1:]:
-            if ha - hb <= 4:
+            if ha - hb <= 4 and not _declared_reuse(proj, ia, ib):
                 r.fail(f"shots {ia} and {ib} look like duplicates", ib)
 
     r.contact_sheet = str(contact_sheet(video, shots, proj.path("output", "contact_sheet.jpg")))

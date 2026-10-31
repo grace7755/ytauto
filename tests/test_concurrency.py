@@ -370,3 +370,44 @@ def test_prefetch_off_and_offline_do_not_start_a_thread(tmp_path, monkeypatch):
     p = _pipeline_with(tmp_path, monkeypatch, Sel, prefetch_ahead=3)
     p.gem = None                                   # offline mode: no judge, nothing to wait on
     p.select_all()
+
+
+def test_neighbouring_shots_cannot_take_nearby_footage_of_one_video(tmp_path):
+    """Measured: 108-113 s and 115-120 s of one tripod shot on shots 1 and 2 played as one
+    frozen shot. A window far away in the same video, or a non-adjacent shot, is still fine."""
+    sel, proj = _selector(tmp_path, adjacent_source_gap=30, max_shots_per_source=3)
+    proj.log_decision(Decision(shot=1, status="accepted", provider="youtube", source_id="x", url="u",
+                               src_start=108, src_end=113))
+    assert not sel._claim("youtube:x", (115.0, 120.0), 2), "next shot, 2 s later in the same video"
+    assert sel._claim("youtube:x", (300.0, 305.0), 2), "same video, far away: a different scene"
+    assert sel._claim("youtube:x", (150.0, 155.0), 5), "not a neighbour"
+
+
+def test_in_flight_neighbour_claims_count_too(tmp_path):
+    sel, _ = _selector(tmp_path, adjacent_source_gap=30)
+    assert sel._claim("youtube:x", (10.0, 15.0), 3)
+    assert not sel._claim("youtube:x", (20.0, 25.0), 4)
+    sel._release("youtube:x", (10.0, 15.0))
+    assert sel._claim("youtube:x", (20.0, 25.0), 4)
+
+
+def test_the_neighbour_rule_can_be_turned_off(tmp_path):
+    sel, proj = _selector(tmp_path, adjacent_source_gap=0)
+    proj.log_decision(Decision(shot=1, status="accepted", provider="youtube", source_id="x", url="u",
+                               src_start=108, src_end=113))
+    assert sel._claim("youtube:x", (115.0, 120.0), 2)
+
+
+def test_redo_never_cuts_the_same_footage_again(tmp_path):
+    """The screen window (8-20 s) contains the clip (10.2-15.2 s): an exact-start match on
+    the window never saw it, so `redo` re-cut the same clip. Overlap is what counts."""
+    sel, proj = _selector(tmp_path)
+    shot = Shot(id=4, segment=0, start=0, end=5, text="t", brief=Brief(visual="v"))
+    proj.log_decision(Decision(shot=4, status="accepted", provider="youtube", source_id="x", url="u",
+                               src_start=10.2, src_end=15.2))
+    used = sel._tried_windows(shot)
+    assert sel._was_tried(used, "youtube:x", (8.0, 20.0))
+    assert not sel._was_tried(used, "youtube:x", (40.0, 52.0)), "a later scene of the same video is fine"
+    assert not sel._was_tried(used, "youtube:y", (8.0, 20.0))
+    other = Shot(id=5, segment=0, start=5, end=10, text="t", brief=Brief(visual="v"))
+    assert not sel._was_tried(sel._tried_windows(other), "youtube:x", (8.0, 20.0)), "only this shot's history"

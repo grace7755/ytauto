@@ -139,3 +139,121 @@ storyboard screening).
 - Licence info for each clip is recorded as reported by the source; YouTube clips are logged as their video's licence.
 - Face detection uses OpenCV Haar cascades (no model download); it flags large faces, not every person in frame.
 - Coverr's API response shape is parsed defensively; confirm with your key on first use.
+
+## Speed settings (config/default.yaml)
+
+| setting | what it does |
+| --- | --- |
+| `direct_verify_video: false` | Native Gemini link judges the clip as a frame grid (like every other link). Measured 4.2 s vs 12.2 s mean per verify. `true` = old inline video. |
+| `judge_hedge_after: 8` | A judge call slower than 8 s (or 2.5x its link's usual time) is also sent to the next link; first answer wins. `0` = off. |
+| `download_ahead: true` | The next screened candidate's section downloads while the current clip is cut and judged. |
+| `defer_ai_check: true` | Skips the extra "is it AI footage" call for clips already rejected on score; run later only if that clip becomes a weak match. |
+
+Extra judge links verified live: `geminiopenai/models/gemini-3.1-flash-lite` (own quota) and `openrouter/nvidia/nemotron-3.5-super-vl:free` (slow, last resort).
+
+### Local checks that save judge calls
+- `local_overlay_check: true` - OCR (`inspect/overlay.py`) rejects text pinned in place over moving footage (watermarks, channel names) before any judge call. Optional dependency: `pip install --no-deps rapidocr-onnxruntime pyclipper shapely six` (plain `pip install rapidocr-onnxruntime` pulls `opencv-python`, which breaks `cv2.CascadeClassifier`). Without it the check is silently off. Measured on 126 past clips: 24 of 64 AI-flagged clips caught, 0 false rejects on 62 clean ones.
+- Channel reputation (shared `cache/`): a channel with 2 watermarked/AI videos and no accepted clip is skipped; good channels rank higher.
+- `shot_workers: 3` was measured: no gain over 2 (6.8 vs 7.0 min; CLIP and scene detection get slower), so 2 stays.
+
+## ChatGPT as a judge (via Nibedita / HeartCode)
+
+A `provider: _heart` link in `judge_chain` runs the `heart` CLI headless (`llm/heart.py`) and gets
+ChatGPT's verdict on the same frame grid or preview sheet the other links see. No API key: it uses
+HeartCode's ChatGPT login, a quota separate from every Gemini key. It is second in the default chain,
+so it takes over when Gemini is slow (backup requests go to it) or out of quota.
+
+- Measured on 126 labelled clips: 58/64 watermark/text clips caught, 3/62 clean ones flagged (2 of
+  those carry an "ON RIDE" watermark Gemini missed), 0 errors, median 6.5 s.
+- A full run with ChatGPT as the only judge (`GEMINI_API_KEY` empty) finished all 12 shots, QA passed.
+- Not installed or login expired: the link is skipped / circuit-broken and the run carries on.
+- It cannot watch YouTube URLs (`screen_mode: url`); that stays Gemini-only.
+
+## New commands
+
+```powershell
+.venv\Scripts\ytauto doctor            # tools, opencv build, OCR, keys, judge links and their quota
+.venv\Scripts\ytauto doctor --live     # + one tiny request per judge link, with its answer time
+.venv\Scripts\ytauto batch scripts\    # every transcript in a folder, one after another, waits out quota
+```
+
+## Nibedita agent
+
+`yt-video-reviewer` (Nibedita, Marketing): after a run it compares every thumbnail with its
+narration, re-selects wrong or weak shots with `ytauto redo` (max 3 rounds) and reports.
+
+## Neighbouring shots
+
+`adjacent_source_gap: 30` - shot N and N+1 may not use footage of one video closer than 30 s
+(two consecutive windows of one tripod shot played as a single frozen shot).
+
+## Finishing pass (`ytauto finish`)
+
+```powershell
+.venv\Scripts\ytauto finish script.json --vo voice.mp3 --title "My Video" --spec finish.yaml --assets E:\video-assets --out final.mp4
+```
+Adds the voice-over, word-timed captions (spoken word highlighted; timing from faster-whisper, spelling
+from the transcript), title / lower-third cards, a music bed ducked under the voice, SFX hits, film grain,
+vignette, light grade, an optional particle overlay and fades. `finish.yaml` keys: `music`, `music_db`,
+`grain`, `grain_opacity`, `particles`, `particles_from`, `tail`, `cards` (`text`, `start`, `end`, `kind:
+title|lower`), `sfx` (`file`, `at`, `gain_db`), `captions`, `font`. Asset names are matched against
+`--assets` sub-folders (`audio/music`, `audio/sfx`, `video/overlays`).
+
+`brief_overrides` (project config): hand-fix one shot's brief when the planned subject has no footage,
+e.g. `8: {subject: "...", youtube_queries: [...]}`, then `redo --shot 8`.
+
+## Speed round 2 (measured on the 87-shot Philippines run)
+
+What the time went to (`logs/timings.json`): section downloads 70 min of work, AI verify of
+downloaded clips 44 min, storyboard screening 33 min; only ~1 in 5 downloads became the clip.
+
+| Setting | Default | What it does |
+|---|---|---|
+| `screen_min_match` | 70 | Candidates the storyboard screen rated below this are tried last (below 70: 6 of 39 downloads usable; 80+: 55 of 154). Deferred, never dropped. |
+| `sibling_extend` | 9.0 | The 2nd/3rd shot of a sentence first tries a *different scene* of the video its previous shot used; the first shot's section is downloaded 9 s longer for it. Shots of one sentence go to the same worker. Still checked and AI-verified. |
+| `judge_lanes` | 2 | The first two judge links are used side by side (least expected wait first) instead of the second only taking overflow. |
+| `library`, `library_min_sim`, `library_tries` | on, 0.28, 2 | Every accepted clip goes into `cache/library`; later shots with the same setting try the best CLIP matches first (no search/screen/download). Max 3 other videos per clip. Back-fill old projects: `ytauto library-add projects/<slug> [--skip N]`. |
+| `remotion_export`, `remotion_bake`, `remotion_grain`, `remotion_dust` | off, on | Export each accepted clip for Remotion (1080p30, 0.6 s cloned tail, film look baked in) in the background while selection runs, plus `words.json`. Manual: `ytauto export-remotion <transcript> --out <dir> [--vo voice.mp3]`. |
+
+Also automatic: videos YouTube reports as gone are remembered in the shared cache (104 repeat
+metadata calls in one run), and a section download reuses the stream URL from the metadata call
+(`ffmpeg -ss -t -i URL -c copy`, the same command yt-dlp runs) - about 2 s less per download,
+identical output; it falls back to yt-dlp when the URL is stale. yt-dlp's
+`concurrent_fragment_downloads` was measured and does nothing for sections (they go through ffmpeg).
+
+Remotion: a composition fed baked clips rendered 900 frames in 69 s against 170 s for live CSS
+grain/dust/filters (2.5x). Concurrency 10 (83 s) and `--gl=angle` (77 s) were slower than 6.
+
+## Production round 3 (relevance, variety, fewer shots, stills, sound)
+
+1. **No clip longer than 5 s.** `shot_target 4.5 / shot_min 3 / shot_max 5`. The maximum wins over the minimum: a
+   5.1 s sentence becomes two 2.55 s shots (only sentences of 5-6 s or under 3 s give a shot below 3 s). Measured
+   on the Philippines script: 4.5/3/5 = 93 shots, 4.5/3/6 = 87 (the 5 s cap costs shots, by design).
+2. **Variety and reuse.** A YouTube video may give any number of different sections (`max_shots_per_source: 0`);
+   sections never overlap and neighbouring shots stay 30 s apart in the source. Other sources (stock, stills) are
+   picked once. The same footage may play a second time only as a last resort before a weak match (`reuse_max_uses 2`):
+   at least `reuse_min_gap` 60 s apart on the timeline, never a still, and judged again against the new shot.
+   `report.json` has `shares` (youtube / stock / still, % of running time), `reused_clips` and `reuse_problems`.
+3. **Generic b-roll goes to stock first** (`stock_first`): the planner marks `generic: true` for ordinary
+   footage (open sea, aerial coast, crowd) that names nothing specific; named places, people and events stay
+   YouTube-first. This is what keeps YouTube near 65-70% of the footage.
+4. **Stills** (`stills`, `sources/images.py`, `stills.py`): when YouTube and stock both fail, a licensed
+   photograph (Pexels, Pixabay, Wikimedia Commons; at least `still_min_width` px) is judged like a clip (relevance,
+   watermark/text, the dedicated AI question) and cut into a slow push / pull / pan clip, so QA, export and
+   assembly need no change. Coverr and Mixkit have no photographs, so photos come from Pexels, Pixabay and Commons. A photo must score
+   `still_min_relevance` 75 (clips: 60) and is judged with the narration before and after it, with the place in the
+   search; a picture that only shares a keyword is rejected. CC-BY credits are written to
+   `output/credits.txt`. `still_share_warn` (10 %) is a guide, not a limit.
+5. **Corner logos** (`watermark_crop`): footage whose only defect is a small logo in one corner and whose
+   source is tall enough (height / 1.15 >= 1080) is re-cut 1.15x closer and judged again, only after
+   YouTube and stock failed. The source stays in the ledger; whether it may be reused is the user's call.
+6. **`ytauto review-shots <project>`** (before rendering): one AI call per ~10 shots compares each shot's
+   frame with its narration; lists shots under 60. Strict on abstract narration, so read the reason before
+   redoing (`redo --shot N`).
+7. **Sound:** `ytauto sfx-plan` picks the few cues and sets their level from measured files (a cue's peak 8-14 dB
+   under the voice's peak, never closer than 8 dB to the voice in its own window; ambience 20 dB under the voice
+   average); `ytauto sfx-audit` checks every cue (file, level under speech, sync with the cuts, spacing, per-minute
+   cap), the voice+effects mix, and the rendered video's loudness and true peak.
+
+Measured/known limits: GL Transitions were tried and not adopted (see `VIDEO-PRODUCTION-GUIDE.md`).
+Everything above was checked with unit tests (270 pass) and one real check per feature; no before/after timing run.

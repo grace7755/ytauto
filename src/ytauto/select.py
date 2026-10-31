@@ -7,22 +7,28 @@ from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from .assemble import cut_clip, tail_for
+from .assemble import CORNERS, corner_crop, cut_clip, tail_for
 from .benchmark import evaluate
 from .cache import Cache
 from .config import Settings
+from .inspect import overlay
 from .inspect.checks import run_checks
 from .inspect.probe import probe
 from .inspect.scenes import best_window
-from .inspect.verify import verify_clip
+from .inspect.verify import verify_clip, verify_still
 from .llm.router import Judge, JudgeError, QuotaExhausted
 from .log import log
 from .models import Candidate, ClipScore, Decision, Shot
 from .screen import screen, screen_storyboards
+from .sources.images import make_photo_providers
 from .sources.stock import Provider
+from .stills import motion_clip, motion_for
 from .sources.youtube import YouTube, text_score
 from .state import Project
 from .timing import stage
+
+REUSED = "REUSED footage"             # in a decision's notes: the same footage as an earlier shot (Selector._reuse)
+AI_DEFERRED = " [AI check deferred]"   # marker in a decision's notes: see Selector._ai_flagged
 
 BAD_FLAGS = {"presenter_on_camera": "creator/presenter on camera", "ai_or_animated": "AI/animated/CGI",
              "black_and_white": "black & white"}
@@ -30,8 +36,11 @@ BAD_FLAGS = {"presenter_on_camera": "creator/presenter on camera", "ai_or_animat
 # Hard rejects that describe the whole *video*, not the window: a channel logo stays on screen for
 # the whole upload and AI footage comes from AI channels. Measured on the speed test, 14 of ~35
 # downloads failed on overlays. Burnt-in text needs two strikes - travel videos often caption only
-# some scenes with a place name, and another window may be clean.
-VIDEO_DEFECTS = {"watermark / channel logo": 1, "AI-generated / animated / CGI": 1, "burnt-in text": 2}
+# some scenes with a place name, and another window may be clean. The AI flag needs two as well:
+# reviewed on 56 videos it rejected (Philippines, Alaska, Japan, Iceland), nearly all were real
+# drone, dive and wildlife footage (a Nat Geo eagle film among them), and one video was accepted
+# for one shot and flagged for the next - one strike banned good videos for every later shot.
+VIDEO_DEFECTS = {"watermark / channel logo": 1, "AI-generated / animated / CGI": 2, "burnt-in text": 2}
 
 
 class Selector:
@@ -42,17 +51,119 @@ class Selector:
         self.sid = {sh.id: i for i, sh in enumerate(shots)}
         self._lock = threading.Lock()
         self._claims: dict[str, list[tuple[float, float]]] = defaultdict(list)   # in-flight windows
+        self._claim_shots: dict[str, list] = defaultdict(list)   # in-flight (window, shot id)
         self._index = None                       # CLIP tile index, loaded on first use
         self._index_failed = False
+        self._wm: dict[int, list[dict]] = defaultdict(list)   # per shot: footage whose only defect is a corner logo
+        self._reusing: set[tuple] = set()      # clips being reused right now (never more than reuse_max_uses)
+        self._photos = None                     # still-picture providers, built on first use
+        self._dl_pool: ThreadPoolExecutor | None = None   # background section downloads (download_ahead)
 
     # ------------------------------------------------------------------
+    # -- channel reputation ------------------------------------------------------
+    # Whole-video defects cluster by channel: one that stamps a logo on one upload stamps it on all
+    # of them, and AI-footage channels upload nothing else. The cache is shared across projects, so
+    # every run teaches the next. Only counts; a channel is skipped after two bad videos and no
+    # accepted clip, and merely ranked down or up before that.
+    def _note_channel(self, c: Candidate, status: str, rejects: list[str]):
+        if self.cache is None or c.provider != "youtube" or not c.channel:
+            return
+        bad = status == "rejected" and any(r.startswith(d) for r in rejects for d in VIDEO_DEFECTS)
+        if status != "accepted" and not bad:
+            return
+        with self._lock:
+            st = self.cache.get("channel_stats", c.channel) or {"ok": 0, "bad": []}
+            if status == "accepted":
+                st["ok"] += 1
+            elif c.source_id not in st["bad"]:
+                st["bad"].append(c.source_id)
+            self.cache.set("channel_stats", st, c.channel)
+
+    def channel_bias(self, c: Candidate) -> int:
+        """-2..+2: how this channel's past clips fared. 0 when unknown."""
+        st = self.cache.get("channel_stats", c.channel) if self.cache is not None and c.channel else None
+        if not st:
+            return 0
+        return max(-2, min(2, min(st["ok"], 2) - min(len(st["bad"]), 2)))
+
+    def bad_channel(self, c: Candidate) -> bool:
+        st = self.cache.get("channel_stats", c.channel) if self.cache is not None and c.channel else None
+        return bool(st) and len(st["bad"]) >= 2 and st["ok"] == 0
+
     def _decide(self, shot: Shot, c: Candidate, status: str, *, clip: Path | None = None, win=(0.0, 0.0),
                 score: ClipScore | None = None, rejects: list[str] | None = None, notes: str = "") -> Decision:
+        self._note_channel(c, status, rejects or [])
         d = Decision(shot=shot.id, status=status, provider=c.provider, source_id=c.source_id, url=c.url,
                      title=c.title, license=c.license, src_start=round(win[0], 2), src_end=round(win[1], 2),
-                     clip_path=str(clip) if clip else "", score=score, hard_rejects=rejects or [], notes=notes)
+                     clip_path=str(clip) if clip else "", score=score, hard_rejects=rejects or [], notes=notes,
+                     credit=c.channel if c.provider.startswith("still_") else "")
         self.proj.log_decision(d)
+        if status == "accepted" and clip is not None:
+            self._to_library(shot, c, d, clip)
         return d
+
+    # -- shared footage library (library.py) ------------------------------------------
+    def _library(self):
+        if not self.s.library or not self.gem:
+            return None                          # offline mode never judged a clip: nothing to share
+        idx = self._tile_index()
+        if idx is None:
+            return None
+        from .library import open_library
+
+        return open_library(self.s.cache_dir / "library", idx.clip)
+
+    def _to_library(self, shot: Shot, c: Candidate, d: Decision, clip: Path):
+        lib = self._library()
+        if lib is None or c.provider.startswith("still_"):      # a still is a last resort, never a library clip
+            return
+        if c.screen_flags.get("library_key"):
+            lib.note_use(c.screen_flags["library_key"], self.proj.root.name)
+            return
+        b = shot.brief
+        try:
+            lib.add(clip=clip, provider=c.provider, source_id=c.source_id, url=c.url, title=c.title,
+                    license=c.license, src_start=d.src_start, src_end=d.src_end,
+                    subject=(b.subject or b.visual) if b else "", setting=b.setting if b else "",
+                    text=shot.text, project=self.proj.root.name)
+        except Exception as e:                   # the library is an optimisation only
+            log.debug("library add failed for %s: %s", c.source_id, str(e)[:160])
+
+    def _from_library(self, shot: Shot) -> Decision | None:
+        """Try approved clips from earlier runs before searching (see library.py). Each one still
+        passes the local checks and the AI verify against this shot's brief."""
+        if self.s.library_tries <= 0 or shot.brief is None:
+            return None
+        lib = self._library()
+        if lib is None or not lib.entries:
+            return None
+        from .inspect.embed import query_text
+
+        try:
+            q = lib.clip.text(query_text(shot.brief))
+        except Exception:
+            return None
+        tried = self._tried(shot)
+        hits = lib.search(q, want=self._clip_len(shot), setting=shot.brief.setting,
+                          project=self.proj.root.name, min_sim=self.s.library_min_sim, limit=self.s.library_tries)
+        for e, sim in hits:
+            key = f"{e['provider']}:{e['source_id']}"
+            win = (e["src_start"], e["src_end"])
+            if f"{key}:{e['src_start']:.0f}" in tried or not self._claim(key, win, shot.id):
+                continue
+            c = Candidate(provider=e["provider"], source_id=e["source_id"], url=e["url"], title=e["title"],
+                          license=e["license"])
+            c.screen_flags["library_key"] = e["key"]
+            log.info("shot %d: trying library clip %s (CLIP %.2f, first used for %r)", shot.id, e["key"], sim,
+                     e["subject"])
+            try:
+                with stage("library"):
+                    d, _ = self._try_file(shot, c, Path(e["file"]), None, 70.0, e["src_start"])
+            finally:
+                self._release(key, win)
+            if d.status == "accepted":
+                return d
+        return None
 
     def _clip_len(self, shot: Shot) -> float:
         i = self.sid[shot.id]
@@ -84,6 +195,23 @@ class Selector:
     def bad_video(self, c: Candidate) -> str | None:
         return self.cache.get("bad_video", c.source_id) if self.cache is not None else None
 
+    def _tried_windows(self, shot: Shot) -> dict[str, list[tuple[float, float]]]:
+        """Source footage this shot already used or rejected, by `provider:source_id`."""
+        out: dict[str, list[tuple[float, float]]] = defaultdict(list)
+        for d in self.proj.ledger():
+            if d.shot == shot.id and d.src_end > d.src_start:
+                out[f"{d.provider}:{d.source_id}"].append((d.src_start, d.src_end))
+        return out
+
+    def _was_tried(self, shot_windows: dict, key: str, window: tuple[float, float]) -> bool:
+        """Does a screened `window` overlap footage this shot already used or rejected?
+
+        The old check compared the screen window's *start* with the ledger's *clip* start; the
+        clip is cut from inside the window, so they never matched and `redo --shot N` cut the
+        same clip out of the same window again (seen: 5 of 7 redos returned the identical clip).
+        """
+        return any(window[0] < z and a < window[1] for a, z in shot_windows.get(key, []))
+
     def _tried(self, shot: Shot) -> set[str]:
         return {f"{d.provider}:{d.source_id}:{d.src_start:.0f}" for d in self.proj.ledger() if d.shot == shot.id}
 
@@ -113,13 +241,29 @@ class Selector:
         # source resolution matters (the output is always 1080p): judge the source, not the re-encode
         if out_info and info:
             out_info.height = min(info.height, out_info.height)
+        if c.provider == "youtube" and self.s.local_overlay_check and overlay.available():
+            # Text pinned in place over moving footage is a watermark / channel mark. Reading it
+            # locally costs ~1 s and saves the judge call (and quota) a verify would spend finding
+            # the same thing: the biggest single hard reject measured over past runs.
+            with stage("overlay (OCR)"):
+                ov = overlay.detect(out)
+            if ov is not None and ov.burnt_in:
+                why = f"burnt-in text / branding overlay (local: {', '.join(ov.persistent[:3])})"
+                d = self._decide(shot, c, "rejected", clip=out, win=win, rejects=[why],
+                                 notes=f"overlay motion={ov.motion:.0f}")
+                self._note_defects(c, [why])
+                return d, out
         verdict = None
         judged = self.gem and self.s.use_gemini_verify and not chk.frozen
         if judged:
+            # A clip already rejected on score gains nothing from the dedicated AI check (it can
+            # only lower the score); measured, ~1 in 5 downloaded clips failed exactly that way.
+            defer = ((lambda v: bool(evaluate(self.s, c, out_info, chk, v, prior)[1]))
+                     if self.s.defer_ai_check else None)
             try:
                 with stage("verify (AI)"):
                     verdict = verify_clip(self.gem, out, shot, f"{c.provider}:{c.source_id}:{int(win[0])}",
-                                          self.s.min_relevance)
+                                          self.s.min_relevance, rejected_anyway=defer)
             except JudgeError as e:
                 if not isinstance(e, QuotaExhausted):
                     self._decide(shot, c, "unavailable", win=win,
@@ -133,10 +277,13 @@ class Selector:
         note = f"blur={chk.blur:.0f} sat={chk.saturation:.2f} face={chk.face:.2f} overlay={chk.overlay:.2f}"
         if verdict:
             note += " | " + (verdict.get("notes") or "")[:200]
+            if verdict.get("ai_check_deferred"):
+                note += AI_DEFERRED
         if rejects:
             d = self._decide(shot, c, "rejected", clip=out, win=win, score=sc, rejects=rejects, notes=note)
             if c.provider == "youtube":
                 self._note_defects(c, rejects)
+                self._keep_for_crop(shot, c, src, a, want, offset, cut_free, avail, info, rejects, verdict, sc)
             return d, out
         return self._decide(shot, c, "accepted", clip=out, win=win, score=sc, notes=note), out
 
@@ -156,8 +303,10 @@ class Selector:
                 if why:
                     continue
                 c.text_score = text_score(c, b.youtube_queries, b.entities)
+                if self.bad_channel(c):
+                    continue                            # a channel that only gave watermarks / AI footage
                 cands.append(c)
-        cands.sort(key=lambda c: -c.text_score)
+        cands.sort(key=lambda c: -(c.text_score + 4 * self.channel_bias(c)))
         return cands
 
     def _pmap(self, fn, items: list, workers: int) -> list:
@@ -168,7 +317,21 @@ class Selector:
         with ThreadPoolExecutor(workers) as ex:
             return list(ex.map(fn, items))
 
-    def _claim(self, key: str, window: tuple[float, float]) -> bool:
+    def _near_neighbour(self, key: str, window: tuple[float, float], shot: int) -> bool:
+        """Does the shot before or after this one use source `key` within `adjacent_source_gap`
+        seconds of `window`? Measured: a ChatGPT-judged run put 108-113 s and 115-120 s of one
+        tripod shot of Fuji on shots 1 and 2 - two clean, relevant clips that played as one
+        frozen shot, and the duplicate-frame QA hash did not catch it. Caller holds the lock."""
+        gap = self.s.adjacent_source_gap
+        if gap <= 0:
+            return False
+        near = [(d.src_start, d.src_end) for d in self.proj.ledger()
+                if d.status in ("accepted", "weak") and f"{d.provider}:{d.source_id}" == key
+                and abs(d.shot - shot) == 1]
+        near += [w for w, sid in self._claim_shots[key] if sid is not None and abs(sid - shot) == 1]
+        return any(max(window[0], a) - min(window[1], z) < gap for a, z in near)
+
+    def _claim(self, key: str, window: tuple[float, float], shot: int | None = None) -> bool:
         """Reserve `window` of source `key` for this shot, or refuse if another shot has it.
 
         Shots run concurrently, so "is this window free?" must count both the ledger (finished
@@ -178,17 +341,27 @@ class Selector:
         with self._lock:
             used_n, used_w = self._used()
             busy = self._claims[key]
-            if used_n[key] + len(busy) >= self.s.max_shots_per_source:
+            # a YouTube video may give any number of different sections (they never overlap, below); every
+            # other source is picked once here - a second use goes through `_reuse`, with its gap rules
+            cap = (self.s.max_shots_per_source or 10 ** 6) if key.startswith("youtube:") else 1
+            if used_n[key] + len(busy) >= cap:
                 return False
             if any(not (window[1] <= a or window[0] >= z) for a, z in used_w.get(key, []) + busy):
                 return False
+            if shot is not None and self._near_neighbour(key, window, shot):
+                return False
             busy.append(window)
+            self._claim_shots[key].append((window, shot))
             return True
 
     def _release(self, key: str, window: tuple[float, float]):
         with self._lock:
             if window in self._claims[key]:
                 self._claims[key].remove(window)
+            for item in self._claim_shots[key]:
+                if item[0] == window:
+                    self._claim_shots[key].remove(item)
+                    break
 
     # -- local pre-ranking -------------------------------------------------------
     def _tile_index(self):
@@ -235,7 +408,8 @@ class Selector:
             log.warning("CLIP pre-ranking failed (%s); using text ranking", str(e)[:160])
             self._index_failed = True
             return pool[:k]
-        ranked = sorted((c for c, _ in has), key=lambda c: (-round(sims[c.source_id], 3), -c.text_score))
+        ranked = sorted((c for c, _ in has),
+                        key=lambda c: (-(round(sims[c.source_id], 3) + 0.004 * self.channel_bias(c)), -c.text_score))
         if self.s.prerank == "filter":
             top = sims[ranked[0].source_id]
             keep = [c for c in ranked if sims[c.source_id] >= top - self.s.prerank_margin]
@@ -251,16 +425,28 @@ class Selector:
         """`_screened` in ranked order, except that a usable candidate whose every proposed tile
         shows text or a logo (`overlay_suspect`) is held back until the clean ones were tried. It
         is a deferral, never a reject: thumbnails are too small to rule on a watermark."""
-        held = []
+        held, low = [], []
         for c, r in self._screened(shot, ready):
             if isinstance(r, dict) and r.get("usable") and r.get("overlay_suspect"):
                 held.append((c, r))
+                continue
+            if isinstance(r, dict) and r.get("usable") and self._low_match(r):
+                low.append((c, r))
                 continue
             yield c, r
         if held:
             log.info("shot %d: trying %d candidate(s) whose thumbnails all show text or a logo",
                      shot.id, len(held))
         yield from held
+        if low:
+            log.info("shot %d: trying %d candidate(s) the screen rated below %d", shot.id, len(low),
+                     self.s.screen_min_match)
+        yield from low
+
+    def _low_match(self, r: dict) -> bool:
+        """Screened usable, but no window reaches `screen_min_match`: tried last (see config)."""
+        floor = self.s.screen_min_match
+        return floor > 0 and bool(r.get("windows")) and max(w.get("match", 0) for w in r["windows"]) < floor
 
     def _screened(self, shot: Shot, ready: list[Candidate]):
         """Yield (candidate, screening result) in ranked order, screening lazily.
@@ -296,8 +482,47 @@ class Selector:
             for c in wave:
                 if c.source_id not in results:                  # no storyboard: single path
                     results[c.source_id] = self._screen_one(shot, c)
+            self._download_ahead(shot, wave, results)
             for c in wave:
                 yield c, results[c.source_id]
+
+    def _download_ahead(self, shot: Shot, wave: list[Candidate], results: dict):
+        """Start fetching the sections of a screened wave's later candidates now.
+
+        The decision loop handles candidates one at a time: download (~10 s of pure transfer),
+        cut, local checks, then a judge call that can take 20 s or more. While that runs the
+        network is idle, so the next candidate's best window is fetched in the background; if the
+        first candidate is accepted the extra section is simply never used. `download_section`
+        holds a per-file lock, so the loop and this thread can never write the same file. It
+        spends no judge calls and makes no decisions; any failure is ignored.
+        """
+        if not self.s.download_ahead or not self.gem:
+            return
+        tried = self._tried(shot)
+        used = self._tried_windows(shot)
+        for c in wave[1:]:                    # the first one is fetched by the loop right away
+            r = results.get(c.source_id)
+            if not isinstance(r, dict) or not r.get("usable") or not r.get("windows"):
+                continue
+            if r.get("overlay_suspect") or any(r.get(k) for k in BAD_FLAGS) or self.bad_video(c) or self._low_match(r):
+                continue
+            w = next(((x["start"], x["end"]) for x in r["windows"]
+                      if f"youtube:{c.source_id}:{x['start']:.0f}" not in tried
+                      and not self._was_tried(used, f"youtube:{c.source_id}", (x["start"], x["end"]))), None)
+            if w is None:
+                continue
+            with self._lock:
+                if self._dl_pool is None:
+                    self._dl_pool = ThreadPoolExecutor(2, thread_name_prefix="dl-ahead")
+                pool = self._dl_pool
+            pool.submit(self._bg_download, c, (w[0], w[1] + self._extend(shot)))
+
+    def _bg_download(self, c: Candidate, w: tuple[float, float]):
+        try:
+            with stage("download (ahead)"):
+                self.yt.download_section(c, w[0], w[1], self.proj.path("sources", "youtube"))
+        except Exception as e:                # purely an optimisation
+            log.debug("download-ahead for %s failed: %s", c.source_id, str(e)[:160])
 
     def _screen_one(self, shot: Shot, c: Candidate):
         """Screening result for one candidate; a JudgeError is returned, not raised, so a pool of
@@ -315,6 +540,8 @@ class Selector:
             self.yt.details(c)                           # cached unless it was past the first batch
             if c.screen_flags.get("live") or (c.height and c.height < self.s.min_source_height):
                 continue
+            if c.screen_flags.get("meta_error"):
+                continue                                 # gone / private: nothing to screen
             if self.bad_video(c):
                 continue                                 # known watermark / AI channel
             ready.append(c)
@@ -352,7 +579,8 @@ class Selector:
                 self._pmap(self.yt.details, cands[: self.s.screen_top_k * 2], self.s.screen_workers)
             ready = self._ready(cands)
             used_n, _ = self._used()
-            ready = [c for c in ready if used_n[f"youtube:{c.source_id}"] < self.s.max_shots_per_source]
+            ready = [c for c in ready if not self.s.max_shots_per_source
+                     or used_n[f"youtube:{c.source_id}"] < self.s.max_shots_per_source]
             ready = self._prerank(shot, ready) if self.gem else ready[: self.s.screen_top_k]
             log.info("shot %d round %d: %d YouTube candidates", shot.id, rnd, len(ready))
             # Screen (in parallel or in batches), then decide in the ranked order - so the outcome
@@ -394,14 +622,17 @@ class Selector:
                     _, used_w = self._used()
                     st = min(max(5.0, d * (0.15 + 0.2 * ((shot.variant + len(used_w.get(key, []))) % 4))), max(5.0, d - 12))
                     options = [((st, st + 8), prior)]
-                options = [o for o in options if f"youtube:{c.source_id}:{o[0][0]:.0f}" not in tried]
-                window = next((o for o in options if self._claim(key, o[0])), None)
+                used = self._tried_windows(shot)
+                options = [o for o in options if f"youtube:{c.source_id}:{o[0][0]:.0f}" not in tried
+                           and not self._was_tried(used, key, o[0])]
+                window = next((o for o in options if self._claim(key, o[0], shot.id)), None)
                 if window is None:
                     continue                             # every window is taken or already tried
                 (window, prior) = window
                 try:
                     with stage("download"):
-                        path = self.yt.download_section(c, window[0], window[1], self.proj.path("sources", "youtube"))
+                        path = self.yt.download_section(c, window[0], window[1] + self._extend(shot),
+                                                        self.proj.path("sources", "youtube"))
                     if not path:
                         continue
                     pad = max(0.0, window[0] - 1.5)
@@ -434,12 +665,18 @@ class Selector:
                     key = f"{c.provider}:{c.source_id}"
                     if any(t.startswith(key + ":") for t in self._tried(shot)):
                         continue
-                    with stage("stock fetch"):
-                        path = prov.fetch(c, self.proj.path("sources", "stock"))
-                    if not path:
+                    win = (0.0, 1e6)                      # the whole file: a stock clip is used once per project
+                    if not self._claim(key, win, shot.id):
                         continue
-                    tried += 1
-                    d, clip = self._try_file(shot, c, path, None, 62.0, 0.0)
+                    try:
+                        with stage("stock fetch"):
+                            path = prov.fetch(c, self.proj.path("sources", "stock"))
+                        if not path:
+                            continue
+                        tried += 1
+                        d, clip = self._try_file(shot, c, path, None, 62.0, 0.0)
+                    finally:
+                        self._release(key, win)
                     if d.status == "accepted":
                         return d
                     if clip and d.score:
@@ -448,20 +685,313 @@ class Selector:
                     break
         return None
 
+    # -- corner logos: re-cut closer so the logo falls outside the picture (last resort) ------------
+    _CROP_OK = ("watermark / channel logo", "cleanliness", "score")     # rejects a logo alone explains
+
+    def _keep_for_crop(self, shot, c, src, a, want, offset, cut_free, avail, info, rejects, verdict, sc):
+        """Remember footage that is good in every way except a small logo in one corner, so the shot can
+        use it if nothing clean is found. Nothing is cut or judged until then."""
+        if not self.s.watermark_crop or not verdict or verdict.get("watermark_corner") not in CORNERS:
+            return
+        if not verdict.get("watermark_or_logo") or any(not r.startswith(self._CROP_OK) for r in rejects):
+            return
+        if info.height / self.s.watermark_crop_zoom < self.s.min_clip_height:
+            return                                              # the closer cut would be soft: not allowed
+        self._wm[shot.id].append(dict(c=c, src=src, a=a, want=want, offset=offset, cut_free=cut_free, avail=avail,
+                                      corner=verdict["watermark_corner"], info=info, total=sc.total))
+
+    def _crop_logo(self, shot: Shot) -> Decision | None:
+        for e in sorted(self._wm.pop(shot.id, []), key=lambda x: -x["total"]):
+            if not self.gem:
+                return None
+            c, a, offset = e["c"], e["a"], e["offset"]
+            key, win = f"youtube:{c.source_id}", (a + offset, a + offset + e["want"])
+            if not self._claim(key, win, shot.id):
+                continue
+            out = self.proj.path("clips") / f"shot{shot.id:03d}_{c.provider}_{c.source_id}_{int(win[0] * 10)}_crop.mp4"
+            try:
+                log.info("shot %d: nothing clean found; trying %s with its %s logo cropped out", shot.id, c.source_id, e["corner"])
+                with stage("crop logo"):
+                    cut_clip(self.s, e["src"], a, e["want"], out, avail=None if e["cut_free"] else e["avail"],
+                             crop=corner_crop(e["corner"], self.s.watermark_crop_zoom))
+                out_info, chk = probe(out), run_checks(out)
+                if out_info:
+                    out_info.height = min(int(e["info"].height / self.s.watermark_crop_zoom), out_info.height)
+                with stage("verify (AI)"):
+                    verdict = verify_clip(self.gem, out, shot, f"{c.provider}:{c.source_id}:{int(win[0])}:crop", self.s.min_relevance)
+                sc, rejects = evaluate(self.s, c, out_info, chk, verdict, 70.0)
+                if verdict is None:
+                    rejects.append("AI verify gave no verdict")
+                note = f"logo cropped out of the {e['corner']} corner ({self.s.watermark_crop_zoom}x) | " + ((verdict or {}).get("notes") or "")[:160]
+                if not rejects:
+                    return self._decide(shot, c, "accepted", clip=out, win=win, score=sc, notes=note)
+                out.unlink(missing_ok=True)
+                log.info("shot %d: the cropped clip still fails: %s", shot.id, "; ".join(rejects)[:160])
+            except JudgeError:
+                out.unlink(missing_ok=True)
+                raise
+            except Exception as ex:
+                out.unlink(missing_ok=True)
+                log.warning("shot %d: logo crop failed: %s", shot.id, str(ex)[:160])
+            finally:
+                self._release(key, win)
+        return None
+
+    # -- reuse: the same footage in a second shot (last resort before a weak match) ---------------
+    def _reuse(self, shot: Shot) -> Decision | None:
+        """Put an earlier shot's footage on this shot as well, only when no new footage, photograph or
+        cropped clip fitted. Rules: at most `reuse_max_uses` appearances of one clip in the video, every
+        pair of appearances at least `reuse_min_gap` s apart on the timeline (which also rules out
+        neighbouring shots), stills never (a photograph plays once), and the clip must still pass the
+        full check against THIS shot's brief. Candidates are ranked by local CLIP, best first."""
+        if self.s.reuse_max_uses < 2 or self.s.reuse_tries <= 0 or not self.gem or shot.brief is None:
+            return None
+        idx = self._tile_index()
+        if idx is None:
+            return None
+        from .inspect.embed import query_text
+        from .review import frame_of
+
+        me = self.shots[self.sid[shot.id]]
+        pool: dict[tuple, list[Decision]] = defaultdict(list)
+        for sh in self.shots:
+            d = self.proj.accepted(sh.id)                       # the current pick only
+            if (d and sh.id != shot.id and d.status in ("accepted", "weak") and d.clip_path
+                    and not d.provider.startswith("still_") and Path(d.clip_path).exists()):
+                pool[(d.provider, d.source_id, round(d.src_start, 1), round(d.src_end, 1))].append(d)
+        q = idx.clip.text(query_text(shot.brief))
+        ranked = []
+        for ident, uses in pool.items():
+            if len(uses) + 1 > self.s.reuse_max_uses:               # this would be one appearance too many
+                continue
+            gaps = []
+            for u in uses:
+                other = self.shots[self.sid[u.shot]]
+                gaps.append(max(me.start - other.end, other.start - me.end))
+            if min(gaps) < self.s.reuse_min_gap:
+                continue
+            f = frame_of(Path(uses[0].clip_path))
+            if f is None:
+                continue
+            sim = float(idx.clip.images([f])[0] @ q)
+            if sim >= self.s.library_min_sim:
+                ranked.append((sim, ident, uses[0], min(gaps)))
+        for sim, ident, d, gap in sorted(ranked, key=lambda x: -x[0])[: self.s.reuse_tries]:
+            with self._lock:
+                if ident in self._reusing:
+                    continue
+                self._reusing.add(ident)
+            want = self._clip_len(shot)
+            out = self.proj.path("clips") / f"shot{shot.id:03d}_{d.provider}_{d.source_id}_{int(d.src_start * 10)}_reuse.mp4"
+            c = Candidate(provider=d.provider, source_id=d.source_id, url=d.url, title=d.title, license=d.license)
+            try:
+                log.info("shot %d: nothing new fits; reusing shot %d's footage (CLIP %.2f, %.0f s apart)", shot.id, d.shot, sim, gap)
+                info = probe(Path(d.clip_path))
+                if not info or info.duration < want * 0.87:
+                    continue
+                with stage("reuse cut"):
+                    cut_clip(self.s, Path(d.clip_path), 0.0, want, out, avail=None if info.duration >= want else info.duration)
+                out_info, chk = probe(out), run_checks(out)
+                with stage("verify (AI)"):
+                    verdict = verify_clip(self.gem, out, shot, f"{d.provider}:{d.source_id}:{int(d.src_start)}:reuse:{shot.id}",
+                                          self.s.min_relevance)
+                sc, rejects = evaluate(self.s, c, out_info, chk, verdict, 70.0)
+                if verdict is None:
+                    rejects.append("AI verify gave no verdict")
+                if not rejects:
+                    return self._decide(shot, c, "accepted", clip=out, win=(d.src_start, d.src_end), score=sc,
+                                        notes=f"{REUSED} of shot {d.shot} ({gap:.0f} s apart) | " + ((verdict or {}).get("notes") or "")[:160])
+                out.unlink(missing_ok=True)
+                log.info("shot %d: the reused clip does not fit this shot: %s", shot.id, "; ".join(rejects)[:160])
+            except JudgeError:
+                out.unlink(missing_ok=True)
+                raise
+            except Exception as ex:
+                out.unlink(missing_ok=True)
+                log.warning("shot %d: reuse failed: %s", shot.id, str(ex)[:160])
+            finally:
+                with self._lock:
+                    self._reusing.discard(ident)
+        return None
+
+    # -- still pictures: the last resort before a weak match --------------------------
+    def _still(self, shot: Shot) -> Decision | None:
+        """A licensed photograph with a slow move when no video (YouTube, stock) fits the shot.
+        Judged exactly like a clip: relevance, watermark/text, and the dedicated AI question."""
+        if not self.s.stills or not self.gem or shot.brief is None:
+            return None
+        if self._photos is None:
+            self._photos = make_photo_providers(self.s)
+        b = shot.brief
+        # the place goes into the first query: "reef" alone finds any reef, the brief wants this one
+        queries = list(dict.fromkeys(q.strip() for q in [f"{b.subject} {b.setting}", b.subject, *(b.stock_queries or [])] if q.strip()))[:3]
+        left = self.s.still_tries
+        for name, prov in self._photos.items():
+            if not prov.available():
+                continue
+            for q in queries:
+                for c in prov.search(q, 4):
+                    if left <= 0:
+                        return None
+                    key = f"{c.provider}:{c.source_id}"
+                    if any(t.startswith(key + ":") for t in self._tried(shot)):
+                        continue
+                    win = (0.0, 1e6)
+                    if not self._claim(key, win, shot.id):          # a picture is used once per project
+                        continue
+                    try:
+                        with stage("still fetch"):
+                            path = prov.fetch(c, self.proj.path("sources", "stills"))
+                        if not path:
+                            continue
+                        left -= 1
+                        d = self._try_still(shot, c, path)
+                    finally:
+                        self._release(key, win)
+                    if d.status == "accepted":
+                        return d
+        return None
+
+    def _context(self, shot: Shot) -> str:
+        """The narration just before and after this shot (other sentences only), so a picture is judged
+        in its place in the story and not on a keyword."""
+        i = self.sid[shot.id]
+        before = next((self.shots[j].text for j in range(i - 1, -1, -1) if self.shots[j].text != shot.text), "")
+        after = next((self.shots[j].text for j in range(i + 1, len(self.shots)) if self.shots[j].text != shot.text), "")
+        return f'Narration before: "{before}"\nNarration after: "{after}"' if before or after else ""
+
+    def _try_still(self, shot: Shot, c: Candidate, path: Path) -> Decision:
+        want = self._clip_len(shot)
+        out = self.proj.path("clips") / f"shot{shot.id:03d}_{c.provider}_{c.source_id}_0.mp4"
+        try:
+            with stage("still clip"):
+                motion_clip(self.s, path, out, want, motion_for(shot.id))
+        except Exception as e:
+            return self._decide(shot, c, "rejected", rejects=[f"still clip failed: {str(e)[:100]}"])
+        with stage("local checks"):
+            info, chk = probe(out), run_checks(out)
+        chk.frozen = False                                  # a slow push on one picture is not a frozen clip
+        try:
+            with stage("verify (AI)"):
+                verdict = verify_still(self.gem, path, shot, f"{c.provider}:{c.source_id}", self.s.min_relevance,
+                                       context=self._context(shot))
+        except JudgeError as e:
+            if not isinstance(e, QuotaExhausted):
+                self._decide(shot, c, "unavailable", rejects=[f"judge chain exhausted during verify: {str(e)[:160]}"])
+            raise
+        sc, rejects = evaluate(self.s, c, info, chk, verdict, 70.0)
+        if verdict is None:
+            rejects.append("AI verify gave no verdict")
+        elif self.s.min_relevance <= sc.relevance < self.s.still_min_relevance:
+            rejects.append(f"relevance {sc.relevance:.0f} < {self.s.still_min_relevance:.0f} (stills must show what the narration is about)")
+        note = f"still by {c.channel} ({c.license}) | " + ((verdict or {}).get("notes") or "")[:200]
+        if rejects:
+            out.unlink(missing_ok=True)
+            return self._decide(shot, c, "rejected", score=sc, rejects=rejects, notes=note)
+        return self._decide(shot, c, "accepted", clip=out, score=sc, notes=note)
+
+    # -- siblings: two shots of one sentence from one download ------------------------
+    def _next_is_sibling(self, shot: Shot) -> bool:
+        i = self.sid[shot.id]
+        return i + 1 < len(self.shots) and self.shots[i + 1].segment == shot.segment
+
+    def _extend(self, shot: Shot) -> float:
+        """Extra seconds to download after the screened window, so the next shot of the same
+        sentence can be cut from this file (`_sibling`) instead of searching from zero."""
+        return self.s.sibling_extend if self.s.sibling_extend > 0 and self._next_is_sibling(shot) else 0.0
+
+    def _sibling(self, shot: Shot) -> Decision | None:
+        """Try a different scene of the YouTube section the previous shot of this sentence used.
+
+        Measured on the Philippines run: 87 shots from 42 sentences, so about half the shots are
+        a 2nd or 3rd shot of a sentence, and each searched, screened and downloaded from zero
+        (~65 s a shot). Two scenes from one well-chosen video is how a documentary cuts anyway.
+        The clip still goes through every local check and the AI verify against its own brief;
+        it must be a different scene (a detected cut between them), so it never plays as one
+        frozen shot - the reason `adjacent_source_gap` exists."""
+        if self.s.sibling_extend <= 0 or shot.variant == 0:
+            return None
+        i = self.sid[shot.id]
+        if i == 0 or self.shots[i - 1].segment != shot.segment:
+            return None
+        prev = self.proj.accepted(self.shots[i - 1].id)
+        if prev is None or prev.provider != "youtube" or prev.status != "accepted":
+            return None
+        key = f"youtube:{prev.source_id}"
+        if any(t.startswith(key + ":") for t in self._tried(shot)):
+            return None                                   # already tried for this shot (resume)
+        src = self._section_with(prev)
+        if src is None:
+            return None
+        path, offset = src
+        want = self._clip_len(shot)
+        from .inspect.scenes import scene_spans
+        used = (prev.src_start - offset, prev.src_end - offset)
+        info = probe(path)
+        if not info:
+            return None
+        spans = scene_spans(path) or [(0.0, info.duration)]
+        # a scene that does not contain any of the used window, long enough for this shot
+        free = [(a, z) for a, z in spans if (z <= used[0] or a >= used[1]) and z - a >= want - 0.05]
+        if not free:
+            return None
+        a, z = max(free, key=lambda sp: sp[1] - sp[0])
+        win = (a + offset, z + offset)
+        if not self._claim(key, win):                     # no neighbour check: different scene
+            return None
+        c = Candidate(provider="youtube", source_id=prev.source_id, url=prev.url, title=prev.title,
+                      license=prev.license)
+        try:
+            self.yt.details(c)                            # cached: recency for the benchmark
+        except Exception:
+            pass
+        try:
+            log.info("shot %d: trying the next scene of shot %d's video %s", shot.id, shot.id - 1, prev.source_id)
+            with stage("sibling"):
+                d, _ = self._try_file(shot, c, path, (a, z), 75.0, offset)
+        finally:
+            self._release(key, win)
+        return d if d.status == "accepted" else None
+
+    def _section_with(self, prev: Decision) -> tuple[Path, float] | None:
+        """The downloaded section of `prev`'s video that covers its window, as (file, start in
+        source seconds). Section files are named `<id>_<start*10>_<end*10>.mp4`."""
+        best = None
+        for f in self.proj.path("sources", "youtube").glob(f"{prev.source_id}_*"):
+            parts = f.stem[len(prev.source_id) + 1:].split("_")
+            if len(parts) != 2 or not all(p.isdigit() for p in parts):
+                continue
+            a, z = int(parts[0]) / 10, int(parts[1]) / 10
+            if a <= prev.src_start + 0.05 and z >= prev.src_end - 0.05 and (best is None or z - a > best[2]):
+                best = (f, a, z - a)
+        return (best[0], best[1]) if best else None
+
     # ------------------------------------------------------------------
     def select(self, shot: Shot) -> Decision | None:
         have = self.proj.accepted(shot.id)
         if have:
             return have
         best: list[Decision] = []
-        d = self._youtube(shot, best) or self._stock(shot, best)
+        d = self._sibling(shot) or self._from_library(shot)
+        if not d:
+            if shot.brief is not None and shot.brief.generic and self.s.stock_first:
+                d = self._stock(shot, best) or self._youtube(shot, best)
+            else:
+                d = self._youtube(shot, best) or self._stock(shot, best)
+        if d:
+            self._cleanup(shot, keep=d, best=best)
+            return d
+        d = self._crop_logo(shot) or self._still(shot) or self._reuse(shot)   # all of them beat a weak match
         if d:
             self._cleanup(shot, keep=d, best=best)
             return d
         # nothing passed: promote the best soft-failure as a clearly flagged weak match
         best = [x for x in best if x.clip_path and Path(x.clip_path).exists()]
-        if best:
+        while best:
             top = max(best, key=lambda x: x.score.total if x.score else 0)
+            if self._ai_flagged(shot, top):
+                best.remove(top)
+                continue
             self._cleanup(shot, keep=top, best=best)
             weak = top.model_copy(update={"status": "weak", "notes": top.notes + " | WEAK MATCH: closest available"})
             self.proj.log_decision(weak)
@@ -469,6 +999,21 @@ class Selector:
             return weak
         log.error("shot %d: no footage found anywhere", shot.id)
         return None
+
+    def _ai_flagged(self, shot: Shot, d: Decision) -> bool:
+        """Run the AI-footage check that `verify_clip` deferred for this clip, now that it is about
+        to be used as a weak match. True = it is AI-generated and has been rejected (and deleted).
+        A judge outage propagates: a clip is never promoted unjudged while a judge is configured."""
+        if not self.gem or AI_DEFERRED not in d.notes:
+            return False
+        cache_id = f"{d.provider}:{d.source_id}:{int(d.src_start)}"
+        if not self.gem.confirm_ai_generated(Path(d.clip_path), cache_key=("aicheck", cache_id)):
+            return False
+        log.info("shot %d: weak candidate %s is AI-generated; dropped", shot.id, Path(d.clip_path).name)
+        self.proj.log_decision(d.model_copy(update={
+            "status": "rejected", "hard_rejects": d.hard_rejects + ["AI-generated / animated / CGI (AI)"]}))
+        Path(d.clip_path).unlink(missing_ok=True)
+        return True
 
     def _cleanup(self, shot: Shot, keep: Decision, best: list[Decision]):
         for x in best:

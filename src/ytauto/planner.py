@@ -46,6 +46,7 @@ PLAN_SCHEMA = {
             "youtube_queries": {"type": "array", "items": {"type": "string"}},
             "stock_queries": {"type": "array", "items": {"type": "string"}},
             "avoid": {"type": "array", "items": {"type": "string"}},
+            "generic": {"type": "boolean", "description": "ordinary b-roll any stock library has; names nothing specific"},
         },
         "required": ["id", "subject", "visual", "entities", "youtube_queries", "stock_queries"]}},
         "topic": {"type": "string", "description": "the one filmable place/subject the video is about"}},
@@ -75,6 +76,10 @@ Return one entry per shot in `shots` (keep id):
   At least half of them must name the main subject itself, not only the area around it.
 - stock_queries: 2 short generic queries (2-4 words) for stock sites.
 - avoid: things that would ruin the shot (e.g. "vlogger talking to camera", "map graphic", "cartoon").
+- generic: true ONLY when the subject is ordinary b-roll that any stock-footage library has (open sea,
+  waves, aerial coastline, sunset, forest, rain, a crowd walking, street food being cooked) AND the
+  narration names no specific place, person, event, landmark or object. False whenever the shot
+  must show something named (a town, a tribe, a volcano, a person, a dish, a festival).
 
 HARD RULES for `visual` - a brief breaking any of these cannot be filled and wastes the shot:
 1. ONE continuous shot from ONE camera. Never describe a montage, a series, a sequence, quick cuts,
@@ -385,11 +390,11 @@ def plan(segments: list[Segment], shots: list[Shot], title: str, s: Settings, ca
             f"[{sh.id}] segment {sh.segment}, shot {sh.variant + 1} of this segment, "
             f"{sh.duration:.1f}s: {sh.text}" for sh in batch)
         prompt = PLAN_PROMPT.format(title=title, nq=s.queries_per_segment, shots=payload,
-                                    dur=f"{s.shot_target:.0f}")
+                                    dur=f"{s.shot_target:g}")
         ids = {sh.id for sh in batch}
         try:
             key = (title, payload, s.queries_per_segment)
-            data = gem.json(prompt, PLAN_SCHEMA, cache_key=("plan-shots-v3",) + key)
+            data = gem.json(prompt, PLAN_SCHEMA, cache_key=("plan-shots-v4",) + key)
             topic = topic or str(data.get("topic") or "").strip()
             for d in data.get("shots") or []:
                 if isinstance(d.get("id"), int) and d["id"] in ids:
@@ -397,7 +402,7 @@ def plan(segments: list[Segment], shots: list[Shot], title: str, s: Settings, ca
                                             visual=d.get("visual", ""), entities=d.get("entities", []),
                                             youtube_queries=d.get("youtube_queries", []),
                                             stock_queries=d.get("stock_queries", []),
-                                            avoid=d.get("avoid", []))
+                                            avoid=d.get("avoid", []), generic=bool(d.get("generic", False)))
             if s.plan_critic:
                 n = _critic(gem, batch, briefs, topic, key)
                 if n:
@@ -428,4 +433,30 @@ def plan(segments: list[Segment], shots: list[Shot], title: str, s: Settings, ca
         b = briefs[sh.id]
         if not b.subject.strip():
             briefs[sh.id] = b.model_copy(update={"subject": primary_subject(b) or topic})
+    for sh in shots:
+        briefs[sh.id] = with_setting(briefs[sh.id], topic, sh.text)
     return briefs
+
+
+def _proper(entity: str, narration: str) -> bool:
+    """A named place or thing ("Hakuba", "Mount Fuji"), not a generic noun ("House")."""
+    caps = [w for w in entity.split() if w[:1].isupper()]
+    return bool(caps) and (entity in narration or len(caps) >= 2)
+
+
+def with_setting(b: Brief, topic: str, narration: str = "") -> Brief:
+    """Pin the video's setting on a brief, and add it to search queries that name no place:
+    "House 4k" found houses anywhere on earth for an Alaska video. A query that names the
+    setting or one of the brief's named places ("hakuba ski 4k") is left as the planner wrote it."""
+    topic = (topic or "").strip()
+    if not topic:
+        return b
+    words = {w.lower()[:5] for w in re.findall(r"[A-Za-z]{4,}", topic)}   # "Alaska" ~ "Alaskan"
+    places = [e.lower() for e in b.entities if _proper(e, narration)]
+
+    def placed(q: str) -> bool:
+        low = q.lower()
+        return any(w in low for w in words) or any(p in low for p in places)
+
+    queries = [q if placed(q) else f"{topic} {q}" for q in b.youtube_queries]
+    return b.model_copy(update={"setting": topic, "youtube_queries": queries})

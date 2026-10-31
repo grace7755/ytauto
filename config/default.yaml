@@ -10,13 +10,21 @@ fps: 30
 crf: 18
 crossfade: 0.0          # 0 = hard cuts; 0.3 gives soft cuts between transcript segments
 
-shot_target: 4.5        # seconds per clip
+# No clip in the final video is longer than 5 s (shot_max). Measured on the Philippines script (42
+# sentences, 340 s): 4.5/3/5 = 93 shots (a 5 s cap splits long sentences into more shots).
+shot_target: 4.5        # seconds per clip (4-5)
 shot_min: 3.0
-shot_max: 6.0
+shot_max: 5.0
 
 min_source_height: 1080
 screen_top_k: 4         # YouTube videos Gemini screens per shot
-max_shots_per_source: 3 # variety: max clips taken from one source video
+max_shots_per_source: 0 # clips taken from one YouTube video: 0 = no limit (different, non-overlapping sections only)
+# Reusing a clip (the same footage in a second shot) is the last resort before a weak match: at most
+# `reuse_max_uses` appearances in the whole video, `reuse_min_gap` seconds between any two of them, never in
+# consecutive shots, and the clip is judged again against the new shot. 0 uses = never reuse
+reuse_max_uses: 2
+reuse_min_gap: 60
+reuse_tries: 2          # earlier clips (best CLIP match first) judged for the new shot
 rounds_per_shot: 2      # fresh-query retries on YouTube before stock fallback
 
 # ---- speed ------------------------------------------------------------------
@@ -30,8 +38,13 @@ shot_workers: 2         # shots selected at the same time (3 ran out of memory o
 prefetch_ahead: 3        # shots prepared in the background (search, metadata, storyboards, CLIP); 0 = off
 screen_workers: 3       # candidates screened at the same time within one shot
 judge_concurrency: 4    # max AI-judge calls in flight at once (rate limits are the real ceiling)
+judge_hedge_after: 8    # a judge call slower than this (or 2.5x its link's usual time) is also sent to the next link; first answer wins. 0 = off
+download_ahead: true    # fetch the next screened candidate's section while the current clip is cut and judged
+heart_concurrency: 2    # ChatGPT (HeartCode) processes at once
+defer_ai_check: true    # skip the extra AI-footage call on a clip already rejected on score (checked later only if it becomes a weak match)
 judge_patience: 60      # seconds to wait for a judge link to recover before giving up a shot
 stock_tries_per_provider: 3
+stock_first: true       # shots the planner marks `generic` (open sea, aerial coast, crowds) try stock before YouTube
 
 min_score: 70           # benchmark pass mark (0-100)
 min_relevance: 60       # hard floor on relevance sub-score
@@ -40,6 +53,15 @@ min_saturation: 0.06
 max_face_ratio: 0.12
 
 fallback_order: [pexels, pixabay, coverr, mixkit]
+
+# ---- last resorts ----------------------------------------------------------------
+stills: true             # a licensed photograph with a slow move when no video fits (Pexels, Pixabay, Commons)
+still_min_relevance: 75  # stricter than clips (min_relevance 60): a photo must show what the narration is about
+still_order: [pexels, pixabay, commons]
+still_min_width: 2000
+still_tries: 3
+watermark_crop: true     # a corner-logo-only clip (source tall enough) is re-cut 1.15x closer, then judged again
+watermark_crop_zoom: 1.15
 
 # ---- AI judge: ordered fallback chain -------------------------------------
 # Walked top to bottom until one provider answers. `provider` is a key in the provider
@@ -57,11 +79,20 @@ judge_chain:
   # the chain moves on when one model's day is spent. Probed live 2026-10-29; the 2.5 models
   # answer 404 "no longer available to new users" on this key.
   - {provider: _direct,      model: "gemini-3.1-flash-lite",           vision: true, youtube: true, rpm: 15}
+  # ChatGPT through Nibedita's HeartCode CLI (llm/heart.py): its own quota, no API key. Measured
+  # 2026-10-30 on 126 labelled clips: caught 58/64 watermark/text clips, flagged 3/62 clean ones
+  # (2 of those carry an "ON RIDE" watermark Gemini missed), 0 errors, median 6.5 s. Skipped
+  # automatically when `heart` is not installed; an expired login just trips the link.
+  - {provider: _heart,       model: "chatgpt gpt-6-luna",              vision: true}
   - {provider: _direct,      model: "gemini-3.5-flash-lite",           vision: true, youtube: true, rpm: 15}
   - {provider: _direct,      model: "gemini-flash-lite-latest",        vision: true, youtube: true, rpm: 15}
   # Fallback: providers from $HEART_CONFIG (another project's file; read, never written).
   - {provider: geminiopenai, model: "models/gemini-2.5-flash-lite",   vision: true, youtube: true, rpm: 15}
   - {provider: geminiopenai, model: "models/gemini-flash-lite-latest", vision: true, youtube: true, rpm: 15}
+  # Verified live 2026-10-29 on 6 known clips (right clip high, wrong clip low, watermark caught):
+  # a second Google project behind the proxy (own quota), and a free vision model (slow, ~20 s).
+  - {provider: geminiopenai, model: "models/gemini-3.1-flash-lite", vision: true, youtube: true, rpm: 15}
+  - {provider: openrouter,   model: "nvidia/nemotron-3.5-super-vl:free", vision: true, max_tokens: 4096}
   # Reasoning model: needs a far bigger budget or it is truncated before it answers at all.
   - {provider: zai,          model: "GLM-4.6V-Flash",                 vision: true, max_tokens: 8192}
   # Last: free tier allows only 20 requests/day on this model (from Google's own 429 message).

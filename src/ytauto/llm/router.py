@@ -25,6 +25,7 @@ from ..config import JudgeLink, Settings
 from ..inspect.grid import extract_grid_data_url, grid_hint
 from ..log import log
 from .gemini import Gemini, GeminiError
+from .heart import HEART, HeartClient, HeartError
 from .providers import DIRECT, ProviderConfig
 from .quota import Quota
 
@@ -197,12 +198,16 @@ class Judge:
         self._down: dict[str, float] = {}
         self._quota_down: dict[str, float] = {}     # links out of their daily quota
         self._direct: Gemini | None = None
+        self._heart: HeartClient | None = None
         self.quota = Quota(cache)
         self._direct_lock = threading.Lock()
         # One cap on in-flight judge calls across all shot and screening threads: provider rate
         # limits, not CPU, are what parallelism runs into (the free links return 429 even serially).
         self._slots = threading.BoundedSemaphore(max(1, settings.judge_concurrency))
         self._direct_failed = False
+        self._latency: dict[str, float] = {}         # moving average of answer time per link, seconds
+        self._inflight: dict[str, int] = {}          # calls running per link (see _lanes)
+        self._inflight_lock = threading.Lock()
         self.calls = 0
         self.tokens = 0
 
@@ -217,6 +222,8 @@ class Judge:
     def _usable(self, link: JudgeLink) -> bool:
         if link.provider == DIRECT:
             return bool(self.s.gemini_key)
+        if link.provider == HEART:
+            return self._heart_client().installed
         if not self.cfg.has(link.provider):
             return False
         return True
@@ -273,8 +280,21 @@ class Judge:
                     self._tag(link), why[:160], secs)
 
     # -- transport -----------------------------------------------------------
+    def _heart_client(self) -> HeartClient:
+        with self._direct_lock:
+            if self._heart is None:
+                self._heart = HeartClient(self.s.heart_concurrency, self.s.heart_timeout)
+            return self._heart
+
     def _post(self, link: JudgeLink, content: list[dict], schema: dict | None,
               timeout: float = TIMEOUT) -> str:
+        if link.provider == HEART:          # ChatGPT through the HeartCode CLI (see llm/heart.py)
+            try:
+                text = self._heart_client().ask(link.model, content, min(timeout, self.s.heart_timeout))
+            except HeartError as e:
+                raise JudgeError(str(e)) from e
+            self.calls += 1
+            return text
         ep = self.cfg.endpoint(link.provider)
         if ep is None:
             raise JudgeError(f"{link.provider} missing from provider config")
@@ -342,27 +362,43 @@ class Judge:
         """
         last: Exception | None = None
         patience = self.s.judge_patience
+
+        def try_link(link: JudgeLink) -> dict | None:
+            """One link's answer; None = skipped without a call (daily cap, no direct client)."""
+            tag = self._tag(link)
+            with self._inflight_lock:
+                self._inflight[tag] = self._inflight.get(tag, 0) + 1
+            try:
+                return _try_link(link)
+            finally:
+                with self._inflight_lock:
+                    self._inflight[tag] -= 1
+
+        def _try_link(link: JudgeLink) -> dict | None:
+            if link.provider == DIRECT:
+                if direct is None or self._direct_failed:
+                    return None
+                if not self.quota.acquire(link):
+                    return None
+                with self._slots:
+                    t0 = time.time()
+                    data = direct(self._direct_client(), link.model)
+                self._note_latency(link, time.time() - t0)
+                self.calls += 1
+                return data
+            t0 = time.time()
+            reply = self._send(link, content_for(link), schema, timeout)
+            if reply is None:
+                return None                            # daily cap reached: not a failure
+            self._note_latency(link, time.time() - t0)
+            return _extract_json(reply)
+
         for attempt in range(2):
-            for link in self._live(need_vision=need_vision, need_youtube=need_youtube):
-                try:
-                    if link.provider == DIRECT:
-                        if direct is None or self._direct_failed:
-                            continue
-                        if not self.quota.acquire(link):
-                            continue
-                        with self._slots:
-                            data = direct(self._direct_client(), link.model)
-                        self.calls += 1
-                        return data
-                    reply = self._send(link, content_for(link), schema, timeout)
-                    if reply is None:
-                        continue                       # daily cap reached: not a failure
-                    return _extract_json(reply)
-                except (JudgeError, GeminiError, ValueError, json.JSONDecodeError) as e:
-                    last = e
-                    if link.provider == DIRECT and isinstance(e, GeminiError) and "API_KEY" in str(e):
-                        self._direct_failed = True     # no key: never retry this link
-                    self._trip(link, str(e))
+            data, err = self._walk(self._lanes(self._live(need_vision=need_vision, need_youtube=need_youtube)),
+                                   try_link)
+            if data is not None:
+                return data
+            last = err or last
             if self.out_of_quota(need_vision=need_vision, need_youtube=need_youtube):
                 self._raise_quota(need_vision, need_youtube)
             if attempt == 0 and patience > 0 and self._recoverable(need_vision, need_youtube):
@@ -371,6 +407,133 @@ class Judge:
                 continue
             break
         raise JudgeError(f"all judge providers failed; last error: {last}")
+
+    def _lanes(self, links: list[JudgeLink]) -> list[JudgeLink]:
+        """Spread calls over the first `judge_lanes` links instead of always starting with the
+        first: put the lane with the shortest expected wait first, (calls in flight + 1) x its
+        usual answer time ("least outstanding requests", the common load-balancer rule). The rest
+        of the chain stays as the fallback order. Measured on the Philippines run, every call went
+        to Gemini first and ChatGPT only saw the overflow, so Gemini's 429s and slow tail set the
+        pace while the second lane sat idle."""
+        n = max(1, self.s.judge_lanes)
+        if n == 1 or len(links) < 2:
+            return links
+        head, rest = links[:n], links[n:]
+        with self._inflight_lock:
+            busy = dict(self._inflight)
+
+        # an unmeasured link is assumed as quick as the quickest known one, so it gets tried
+        # (and measured) instead of being starved by a link that merely answered first
+        known = [self._latency[self._tag(l)] for l in head if self._tag(l) in self._latency]
+        default = min(known) if known else 6.0
+
+        def wait(link: JudgeLink) -> float:
+            tag = self._tag(link)
+            return (busy.get(tag, 0) + 1) * self._latency.get(tag, default)
+
+        return sorted(head, key=wait) + rest       # stable: chain order breaks ties
+
+    def _note_latency(self, link: JudgeLink, secs: float):
+        tag = self._tag(link)
+        old = self._latency.get(tag)
+        self._latency[tag] = secs if old is None else 0.7 * old + 0.3 * secs
+
+    def _hedge_delay(self, link: JudgeLink) -> float:
+        """How long to wait on `link` before hedging: the configured floor, or 2.5x what this link
+        usually takes if that is longer, so a link that is always slow (~10 s) is not hedged on
+        every call, which would double its quota use for nothing."""
+        return max(self.s.judge_hedge_after, 2.5 * self._latency.get(self._tag(link), 0.0))
+
+    def _fastest_first(self, queue: list[JudgeLink]):
+        """Put the link with the clearly lowest measured answer time at the head of `queue`: a hedge
+        exists to beat a slow call, so it should go to a link known to be quick, not just the next
+        one in chain order (measured here: 2-3 s for one Gemini lite model, 8-11 s for the next).
+        Chain order is kept unless the faster link is under 60% of the next one's time."""
+        known = [l for l in queue if self._tag(l) in self._latency]
+        if len(queue) < 2 or not known:
+            return
+        best = min(known, key=lambda l: self._latency[self._tag(l)])
+        head = self._latency.get(self._tag(queue[0]))
+        if best is not queue[0] and (head is None or self._latency[self._tag(best)] < 0.6 * head):
+            queue.remove(best)
+            queue.insert(0, best)
+
+    def _link_failed(self, link: JudgeLink, e: Exception):
+        if link.provider == DIRECT and isinstance(e, GeminiError) and "API_KEY" in str(e):
+            self._direct_failed = True                 # no key: never retry this link
+        self._trip(link, str(e))
+
+    def _has_free_slot(self) -> bool:
+        if self._slots.acquire(blocking=False):
+            self._slots.release()
+            return True
+        return False
+
+    def _walk(self, links: list[JudgeLink], try_link: callable) -> tuple[dict | None, Exception | None]:
+        """Try `links` in order until one answers: (data, None), or (None, last error).
+
+        With `judge_hedge_after` > 0 a link that has not answered after that many seconds is
+        *hedged*: the next link is asked as well and the first answer wins. Measured on the free
+        Gemini key: the identical frame-grid request took 2.0, 2.1, 4.3, 22.5, 34.4 and 52.0 s, so
+        the slow tail is server-side jitter, not the request. One hedge per call, and only while
+        an in-flight slot is free, so it can never starve other calls.
+        """
+        last: Exception | None = None
+        hedge = self.s.judge_hedge_after
+        errors = (JudgeError, GeminiError, ValueError, json.JSONDecodeError)
+        if hedge <= 0 or len(links) < 2:
+            for link in links:
+                try:
+                    data = try_link(link)
+                except errors as e:
+                    last = e
+                    self._link_failed(link, e)
+                    continue
+                if data is not None:
+                    return data, None
+            return None, last
+
+        from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+
+        queue = list(links)
+        pending: dict = {}
+        hedged = False
+        ex = ThreadPoolExecutor(max_workers=2, thread_name_prefix="judge-hedge")
+
+        def launch():
+            link = queue.pop(0)
+            pending[ex.submit(try_link, link)] = link
+
+        try:
+            launch()
+            while pending:
+                can_hedge = bool(queue) and not hedged and len(pending) == 1
+                first = next(iter(pending.values()))
+                done, _ = wait(pending, timeout=self._hedge_delay(first) if can_hedge else None,
+                               return_when=FIRST_COMPLETED)
+                if not done:                                  # slow: ask the next link too
+                    hedged = True
+                    self._fastest_first(queue)
+                    if self._has_free_slot():
+                        log.info("judge %s slow (>%.0fs); hedging with %s", self._tag(first),
+                                 self._hedge_delay(first), self._tag(queue[0]))
+                        launch()
+                    continue
+                for f in done:
+                    link = pending.pop(f)
+                    try:
+                        data = f.result()
+                    except errors as e:
+                        last = e
+                        self._link_failed(link, e)
+                        continue
+                    if data is not None:
+                        return data, None
+                if not pending and queue:
+                    launch()
+            return None, last
+        finally:
+            ex.shutdown(wait=False)                           # a slower loser finishes on its own
 
     def _recoverable(self, need_vision: bool, need_youtube: bool) -> bool:
         """Is any link down only briefly (not out of daily quota, not missing its key)?"""
@@ -458,9 +621,17 @@ class Judge:
             return [{"type": "text", "text": full},
                     {"type": "image_url", "image_url": {"url": data_url}}]
 
-        data = self._run(content, schema, need_vision=True,
-                         direct=lambda g, m: g.json_video_file(Path(path), prompt, schema, fps=fps,
-                                                               model=m))
+        def direct_call(g, m):
+            if self.s.direct_verify_video:
+                return g.json_video_file(Path(path), prompt, schema, fps=fps, model=m)
+            # The same frame grid every other link gets. Measured on 10 known clips with the same
+            # model: video 12.2 s mean (median 4.7, one 62 s) vs grid 4.2 s (median 2.8), identical
+            # verdicts within 10 points, and the grid flagged the "ON RIDE" watermark the video
+            # verdict only called text. Inline video is the slow tail of every verify.
+            jpeg = base64.b64decode(data_url.split(",", 1)[1])
+            return g.json_images(grid_hint(cols, rows) + "\n\n" + prompt, [jpeg], schema, model=m)
+
+        data = self._run(content, schema, need_vision=True, direct=direct_call)
         if cache_key is not None:
             self.cache.set("judge", data, *cache_key)
         return data

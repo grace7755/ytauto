@@ -27,6 +27,9 @@ dependencies = [
 
 [project.optional-dependencies]
 test = ["pytest"]
+# Install with --no-deps (it pulls opencv-python, which shadows opencv-python-headless and
+# removes cv2.CascadeClassifier), then: pip install pyclipper shapely six
+ocr = ["rapidocr-onnxruntime"]
 
 [project.scripts]
 ytauto = "ytauto.cli:app"

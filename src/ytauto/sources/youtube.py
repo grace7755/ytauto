@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import re
+import shutil
+import subprocess
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -15,7 +18,22 @@ from ..log import log
 from ..models import Candidate
 from . import storyboard
 
+# One lock per output file: a section may be fetched ahead in the background while the selector
+# asks for the same window, and two yt-dlp runs must never write one file.
+_DL_GUARD = threading.Lock()
+_DL_LOCKS: dict[str, threading.Lock] = {}
+
 _WORD = re.compile(r"[a-z0-9]+")
+
+
+_GONE = ("video is not available", "private video", "video unavailable", "has been removed",
+         "account associated with this video has been terminated", "no longer available")
+
+
+def is_gone(err: str) -> bool:
+    """A permanent "this video is gone" error, as opposed to a network or bot-check failure."""
+    low = err.lower()
+    return any(g in low for g in _GONE) and "sign in to confirm" not in low
 
 
 def _tokens(s: str) -> set[str]:
@@ -45,6 +63,7 @@ class YouTube:
     def __init__(self, settings: Settings, cache: Cache):
         self.s = settings
         self.cache = cache
+        self._streams: dict[str, tuple[str, dict, float]] = {}   # see _remember_stream
 
     def _opts(self, **extra) -> dict:
         o = {"quiet": True, "no_warnings": True, "noprogress": True, "retries": 5,
@@ -93,6 +112,10 @@ class YouTube:
         """Fill height/upload_date/license/tags/description without downloading."""
         meta = self.cache.get("yt_meta", c.source_id)
         if meta is None:
+            gone = self.cache.get("yt_gone", c.source_id)
+            if gone:
+                c.screen_flags["meta_error"] = gone
+                return c
             try:
                 with yt_dlp.YoutubeDL(self._opts(skip_download=True)) as ydl:
                     info = ydl.extract_info(c.url, download=False)
@@ -109,9 +132,15 @@ class YouTube:
                     "storyboard": storyboard.spec_from_info(info),
                 }
                 self.cache.set("yt_meta", meta, c.source_id)
+                self._remember_stream(c.source_id, info)
             except Exception as e:
                 log.warning("metadata failed for %s: %s", c.url, e)
                 c.screen_flags["meta_error"] = str(e)[:200]
+                if is_gone(str(e)):
+                    # Measured: 104 metadata calls failed this way in one 87-shot run, the same
+                    # videos turning up again in later shots' searches. Remembered in the shared
+                    # cache, so no project asks again.
+                    self.cache.set("yt_gone", str(e)[:200], c.source_id)
                 return c
         c.height, c.upload_date, c.license = meta["height"], meta["upload_date"], meta["license"]
         c.description, c.tags = meta["description"], meta["tags"]
@@ -160,7 +189,61 @@ class YouTube:
         a, b = max(0.0, start - pad), end + pad
         dest_dir.mkdir(parents=True, exist_ok=True)
         out = dest_dir / f"{c.source_id}_{int(a * 10):06d}_{int(b * 10):06d}.mp4"
+        with _DL_GUARD:
+            lock = _DL_LOCKS.setdefault(str(out), threading.Lock())
+        with lock:                        # a concurrent caller waits here, then finds the file
+            return self._download_section_locked(c, a, b, dest_dir, out)
+
+    def _remember_stream(self, source_id: str, info: dict):
+        """Keep the direct stream URL from a metadata call for this run's section downloads.
+
+        Every yt-dlp section download starts with its own page extraction, ~2.2 s measured,
+        about a quarter of a download - for a video whose metadata call fetched the same formats
+        seconds earlier. yt-dlp then runs `ffmpeg -ss A -t D <headers> -i URL -c copy`; this does
+        the same with the remembered URL. In memory only: the URLs expire after a few hours."""
+        fmts = [f for f in info.get("formats") or [] if f.get("vcodec") not in (None, "none")
+                and (f.get("acodec") in (None, "none")) and (f.get("height") or 0) <= self.s.height
+                and str(f.get("protocol", "")).startswith("http") and f.get("url")]
+        if not fmts:
+            return
+        best = max(fmts, key=lambda f: (str(f.get("vcodec", "")).startswith("avc1"), f.get("height") or 0,
+                                        f.get("tbr") or 0))
+        m = re.search(r"[?&]expire=(\d+)", best["url"])
+        expire = float(m.group(1)) if m else time.time() + 3600
+        with _DL_GUARD:
+            if not hasattr(self, "_streams"):
+                self._streams = {}
+            self._streams[source_id] = (best["url"], best.get("http_headers") or info.get("http_headers") or {},
+                                        expire)
+
+    def _direct_section(self, source_id: str, a: float, b: float, out: Path) -> bool:
+        with _DL_GUARD:
+            got = getattr(self, "_streams", {}).get(source_id)
+        if not got or got[2] - time.time() < 600 or not shutil.which("ffmpeg"):
+            return False
+        url, headers, _ = got
+        cmd = ["ffmpeg", "-y", "-v", "error", "-ss", f"{a:.3f}", "-t", f"{b - a:.3f}"]
+        if headers:
+            cmd += ["-headers", "".join(f"{k}: {v}\r\n" for k, v in headers.items())]
+        cmd += ["-i", url, "-map", "0:v:0", "-c", "copy", str(out)]
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        except (subprocess.TimeoutExpired, OSError) as e:
+            log.debug("direct section download failed for %s: %s", source_id, e)
+            out.unlink(missing_ok=True)
+            return False
+        if r.returncode != 0 or not out.exists() or out.stat().st_size <= 10_000:
+            log.debug("direct section download failed for %s: %s", source_id, r.stderr[:160])
+            out.unlink(missing_ok=True)
+            with _DL_GUARD:
+                self._streams.pop(source_id, None)      # stale or refused: let yt-dlp do it
+            return False
+        return True
+
+    def _download_section_locked(self, c: Candidate, a: float, b: float, dest_dir: Path, out: Path) -> Path | None:
         if out.exists() and out.stat().st_size > 10_000:
+            return out
+        if self._direct_section(c.source_id, a, b, out):
             return out
         opts = self._opts(
             format=f"bestvideo[height<={self.s.height}][vcodec^=avc1]/bestvideo[height<={self.s.height}]/best[height<={self.s.height}]",

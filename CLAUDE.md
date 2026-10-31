@@ -203,3 +203,12 @@ All tests are offline and deterministic; ffmpeg-dependent ones skip when it is a
 changing judge or benchmark behaviour, encode the *measured* rule in a test rather than the
 intended one - several thresholds here were corrected after measuring real clips, and the tests
 record those findings.
+
+## Production round 3 (30 Oct 2026)
+
+- Shot order in `Selector.select`: sibling -> library -> (`generic` shots with `stock_first`: stock, YouTube; else YouTube, stock) -> `_crop_logo` (corner-logo-only footage, re-cut 1.15x) -> `_still` (licensed photograph, `stills.py` makes the push/pull/pan clip; relevance at least `still_min_relevance`) -> `_reuse` -> weak match. Clips are never longer than `shot_max` (5 s).
+- `Selector._claim`: a YouTube video gives any number of non-overlapping sections (`max_shots_per_source` 0 = no limit), every other provider (stock, `still_*`) is picked once. A second use of the same footage is `Selector._reuse` (last resort after `_still`; `reuse_max_uses` 2, `reuse_min_gap` 60 s, never a still, judged again; notes carry `REUSED footage`, which `qa._declared_reuse` accepts as not a duplicate). Stills are never added to the library.
+- New commands: `review-shots <project>` (AI compares each shot's frame with its narration), `sfx-plan`, `sfx-audit` (`sfx.py`: levels set from measured files; audit checks level under speech, cut sync, spacing, mix loudness/peak).
+- `Decision.credit` holds a still's author; `report.py` writes `output/credits.txt` (CC-BY only) and `shares` / `reused_clips` / `reuse_problems` in `report.json`.
+- The planner cache key is `plan-shots-v4` (the `generic` field); an old cached plan is re-planned.
+- Tests: `tests/test_production3.py` (all offline; two need ffmpeg).

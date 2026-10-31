@@ -46,6 +46,9 @@ def run(transcript: Path, title: Optional[str] = typer.Option(None, help="Projec
         raise typer.Exit(3)
     bad = [r for r in data["shots"] if r["status"] in ("weak", "MISSING")]
     typer.echo(f"\nvideo : {p.proj.path('output', 'final.mp4')}\nreport: {p.proj.path('report.html')}")
+    typer.echo(f"share of running time: {data['shares']}   clips used twice: {len(data['reused_clips'])}")
+    for prob in data["reuse_problems"]:
+        typer.echo(f"REUSE RULE BROKEN: {prob}")
     typer.echo(f"sources: {data['provider_counts']}   weak/missing shots: {[r['shot'] for r in bad]}")
     if data["blockers"]:
         typer.echo("BLOCKERS:\n  " + "\n  ".join(data["blockers"]))
@@ -114,5 +117,226 @@ def quota(config: Optional[Path] = None):
         typer.echo(f"{r['link']:50} {r['used_today']:>5} / {cap:<5} rpm={r['rpm'] or '-'}{out}")
 
 
+@app.command()
+def finish(transcript: Path, vo: Path = typer.Option(..., help="Voice-over audio"),
+           title: Optional[str] = None, config: Optional[Path] = None,
+           spec: Optional[Path] = typer.Option(None, help="YAML: music, cards, sfx, grain, particles"),
+           assets: Optional[Path] = typer.Option(None, help="Asset library (music/sfx/overlays) for names in the spec"),
+           out: Optional[Path] = typer.Option(None, help="Output file (default output/final_finished.mp4)")):
+    """Finish a selected project: voice-over, word-timed captions, titles, ducked music, SFX, grain."""
+    import yaml
+
+    from . import finish as F
+    from .transcript import load_transcript
+
+    p = _pipe(transcript, title, None, config, False)
+    video = p.proj.path("output", "final.mp4")
+    if not video.exists():
+        raise typer.BadParameter(f"run the project first: {video} is missing")
+    data = yaml.safe_load(spec.read_text(encoding="utf-8")) if spec else {}
+
+    def asset(v, sub):
+        if not v:
+            return None
+        f = Path(v)
+        if f.exists():
+            return f
+        hit = F.pick(assets, sub, str(v).lower()) if assets else None
+        if hit is None:
+            raise typer.BadParameter(f"asset not found: {v}")
+        return hit
+
+    fs = F.FinishSpec(
+        vo=vo, music=asset(data.get("music"), "audio/music"), music_db=float(data.get("music_db", -14)),
+        sfx=[F.Sfx(asset(x["file"], "audio/sfx"), float(x["at"]), float(x.get("gain_db", -14)))
+             for x in data.get("sfx", [])],
+        cards=[F.TextCard(c["text"], float(c["start"]), float(c["end"]), c.get("kind", "lower"))
+               for c in data.get("cards", [])],
+        grain=asset(data.get("grain"), "video/overlays"), grain_opacity=float(data.get("grain_opacity", 0.10)),
+        particles=asset(data.get("particles"), "video/overlays"), particles_from=data.get("particles_from"),
+        tail=float(data.get("tail", 1.5)), captions=bool(data.get("captions", True)),
+        font=data.get("font", "Arial Black"))
+    target = out or p.proj.path("output", "final_finished.mp4")
+    F.render(video, fs, load_transcript(transcript), target, p.proj.path("finish"))
+    typer.echo(f"finished: {target}")
+
+
+@app.command("export-remotion")
+def export_remotion(transcript: Path, out: Path = typer.Option(..., help="Folder for sNN.mp4 + shots.json + words.json"),
+                    title: Optional[str] = None, vo: Optional[Path] = typer.Option(None, help="Voice-over: also write words.json"),
+                    config: Optional[Path] = None,
+                    bake: Optional[bool] = typer.Option(None, help="Bake the film look in (default: remotion_bake)")):
+    """Export a selected project's clips for a Remotion composition (1080p30, padded tail, optional
+    baked look). `run` does this during selection when `remotion_export` is set; this is for an
+    existing project or after a `redo`. Clips already exported from the same source are skipped."""
+    from .export import write_words
+
+    p = _pipe(transcript, title, vo, config, False)
+    if vo is None and p.proj.path("metadata", "aligned_segments.json").exists():
+        # without the voice-over, prepare() would re-split the transcript on its own timestamps:
+        # different shots than the project's (and it rewrites metadata/shots.json)
+        raise typer.BadParameter("this project was timed to a voice-over: pass the same --vo")
+    if bake is not None:
+        p.s = p.s.model_copy(update={"remotion_bake": bake})
+    p.prepare()
+    ex = p.make_exporter(out)
+    missing = []
+    for sh in p.shots:
+        d = p.proj.accepted(sh.id)
+        if d is None:
+            missing.append(sh.id)
+            continue
+        ex.submit(sh, d.clip_path)
+    shots_json = ex.finish(p.shots)
+    typer.echo(f"clips + {shots_json}")
+    if vo:
+        typer.echo(f"words: {write_words(vo, p.segments, out / 'words.json')}")
+    if missing:
+        typer.echo(f"shots without a clip (not exported): {missing}")
+        raise typer.Exit(1)
+
+
+@app.command("library-add")
+def library_add(project: Path = typer.Argument(..., help="A project folder (projects/<slug>)"),
+                skip: list[int] = typer.Option([], help="Shot ids NOT to add (clips you replaced by hand)"),
+                config: Optional[Path] = None):
+    """Add a finished project's accepted clips to the shared footage library (`run` does this for
+    every clip it accepts; this back-fills projects made before the library existed)."""
+    from .inspect.embed import Clip
+    from .library import open_library
+    from .models import Shot
+    from .state import Project
+
+    s = load_settings(config)
+    lib = open_library(s.cache_dir / "library", Clip(s.cache_dir / "models"))
+    shots = {d["id"]: Shot(**d) for d in json.loads((project / "metadata" / "shots.json").read_text(encoding="utf-8"))}
+    added, proj = 0, Project(project)
+    for sid, sh in shots.items():
+        d = proj.accepted(sid)                   # the current pick only: not clips later replaced
+        if d is None or d.status != "accepted" or sid in skip or d.provider.startswith("still_"):
+            continue
+        b = sh.brief
+        added += lib.add(clip=Path(d.clip_path), provider=d.provider, source_id=d.source_id, url=d.url,
+                         title=d.title, license=d.license, src_start=d.src_start, src_end=d.src_end,
+                         subject=(b.subject or b.visual) if b else "", setting=b.setting if b else "",
+                         text=sh.text, project=project.name)
+    typer.echo(f"added {added} clips; library has {len(lib.entries)}")
+
+
+@app.command()
+def doctor(live: bool = typer.Option(False, help="Also send one tiny request to every judge link "
+                                                 "(costs one request of each link's quota)"),
+           config: Optional[Path] = None):
+    """Check tools, optional features and the judge chain before a long run."""
+    from .doctor import run_all
+
+    s = load_settings(config)
+    checks = run_all(s, Cache(s.cache_dir), live)
+    for name, ok, detail in checks:
+        typer.echo(f"{'OK ' if ok else 'NO '} {name:42} {detail}")
+    hard = [c for c in checks if not c[1] and c[0] in ("ffmpeg", "ffprobe", "yt-dlp", "opencv", "judge chain")]
+    if hard:
+        raise typer.Exit(1)
+
+
+@app.command()
+def batch(scripts: list[Path] = typer.Argument(..., help="Transcript files, or folders of .txt/.srt/.vtt/.json"),
+          config: Optional[Path] = None, verbose: bool = False,
+          wait: bool = typer.Option(True, help="Wait out the judge's daily quota instead of stopping")):
+    """Run several transcripts one after another (title = file name). A failing video is
+    reported and skipped; the others still run. Each one is resumable like `run`."""
+    files: list[Path] = []
+    for p in scripts:
+        if p.is_dir():
+            files += sorted(f for f in p.iterdir() if f.suffix.lower() in (".txt", ".srt", ".vtt", ".json"))
+        else:
+            files.append(p)
+    results = []
+    for i, f in enumerate(files, 1):
+        typer.echo(f"\n=== [{i}/{len(files)}] {f.name}")
+        t0 = time.time()
+        try:
+            pipe = _pipe(f, None, None, config, verbose)
+            data = pipe.run(wait=wait)
+            bad = [r["shot"] for r in data["shots"] if r["status"] in ("weak", "MISSING")]
+            state = "BLOCKED" if data["blockers"] else ("PAUSED" if data.get("quota_paused_until") else "done")
+            results.append((f.name, state, f"{(time.time() - t0) / 60:.1f} min, weak/missing {bad}",
+                            str(pipe.proj.path("output", "final.mp4"))))
+        except Exception as e:                     # noqa: BLE001 - one bad script must not stop the queue
+            results.append((f.name, "FAILED", str(e)[:120], ""))
+    typer.echo("\n=== batch summary")
+    for name, state, detail, out in results:
+        typer.echo(f"{state:8} {name:40} {detail}  {out}")
+    if any(r[1] != "done" for r in results):
+        raise typer.Exit(1)
+
+
 if __name__ == "__main__":
     app()
+
+
+@app.command("sfx-plan")
+def sfx_plan(events: Path = typer.Argument(..., help='JSON list of {"kind": hook|chapter|zoom|stat|statbig|impact, "at": seconds}'),
+             vo: Path = typer.Option(..., help="The voice-over file (levels are set against it)"),
+             audio_dir: Path = typer.Option(..., help="Folder of <name>.mp3 sound files"),
+             total: float = typer.Option(..., help="Video length in seconds"),
+             out: Path = typer.Option(..., help="Where to write sfx.json"),
+             beds: Optional[Path] = typer.Option(None, help='JSON list of {"name", "from", "to"} ambience beds'),
+             shots: Optional[Path] = typer.Option(None, help="shots.json: chapter and zoom effects snap onto its cuts")):
+    """Choose the few sound effects a film needs and set their levels under the voice."""
+    from . import sfx
+
+    p = sfx.plan(json.loads(events.read_text(encoding="utf-8")), vo, audio_dir, total,
+                 beds=json.loads(beds.read_text(encoding="utf-8")) if beds else None,
+                 cuts=[float(s["t0"]) for s in json.loads(shots.read_text(encoding="utf-8"))] if shots else None)
+    out.write_text(json.dumps(p, indent=1), encoding="utf-8")
+    typer.echo(f"{len(p['cues'])} cues, {len(p['beds'])} beds, {len(p['dropped'])} events dropped (too close or too many) -> {out}")
+
+
+@app.command("sfx-audit")
+def sfx_audit(plan: Path = typer.Argument(..., help="sfx.json from `sfx-plan`"),
+              vo: Path = typer.Option(..., help="The voice-over file"),
+              audio_dir: Path = typer.Option(..., help="Folder of <name>.mp3 sound files"),
+              shots: Path = typer.Option(..., help="shots.json (cut times t0), as written by export-remotion"),
+              video: Optional[Path] = typer.Option(None, help="The rendered video: its loudness and peak are checked too")):
+    """Check every sound effect (level under the voice, sync with the cuts, spacing, files) and the whole mix."""
+    from . import sfx
+
+    r = sfx.audit(sfx.load(plan), vo, audio_dir, json.loads(shots.read_text(encoding="utf-8")), video)
+    for row in r["rows"]:
+        typer.echo(f"{row['at']:7.2f}s {row['kind']:8} {row['name']:14} margin={row.get('margin', '-')} cut_offset={row.get('cut_offset', '-')}")
+    typer.echo(f"mix: {r['mix_lufs']:.1f} LUFS, peak {r['mix_peak']:.1f} dBTP"
+               + (f"; video: {r['video_lufs']:.1f} LUFS, peak {r['video_peak']:.1f} dBTP" if "video_lufs" in r else ""))
+    if r["issues"]:
+        typer.echo("ISSUES:\n  " + "\n  ".join(r["issues"]))
+        raise typer.Exit(1)
+    typer.echo("audio check passed")
+
+
+@app.command("review-shots")
+def review_shots(project: Path = typer.Argument(..., help="A project folder (projects/<slug>)"),
+                 below: int = typer.Option(60, help="List shots the review rates under this (0-100)"),
+                 config: Optional[Path] = None):
+    """Before rendering: have the AI compare every shot's picture with its narration (one call per ~10
+    shots) and list the ones that do not show what is being said. Fix them with `redo --shot N`."""
+    from .models import Shot
+    from .state import Project
+
+    s = load_settings(config)
+    gem = make_judge(s, Cache(s.cache_dir))
+    if gem is None:
+        typer.echo("no AI judge is configured; nothing to review")
+        raise typer.Exit(2)
+    from .review import review
+
+    shots = [Shot(**d) for d in json.loads((project / "metadata" / "shots.json").read_text(encoding="utf-8"))]
+    rows = review(gem, Project(project), shots)
+    (project / "output").mkdir(exist_ok=True)
+    (project / "output" / "review.json").write_text(json.dumps(rows, indent=1), encoding="utf-8")
+    weak = [r for r in rows if 0 <= r["match"] < below]
+    unrated = [r for r in rows if r["match"] < 0]
+    typer.echo(f"reviewed {len(rows)} shots: {len(weak)} below {below}, {len(unrated)} not rated -> {project / 'output' / 'review.json'}")
+    for r in weak:
+        typer.echo(f"  shot {r['shot']:3} match={r['match']:3}  {r['narration'][:60]!r}: {r['why']}")
+    if weak or unrated:
+        raise typer.Exit(1)

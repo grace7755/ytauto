@@ -67,9 +67,9 @@ class Settings(BaseModel):
     crf: int = 18
     crossfade: float = 0.0  # seconds between segments; 0 = hard cuts
     # shots
-    shot_target: float = 4.5
+    shot_target: float = 4.5      # no clip in the final video is longer than shot_max
     shot_min: float = 3.0
-    shot_max: float = 6.0
+    shot_max: float = 5.0
     # youtube search
     queries_per_segment: int = 4
     # one extra planner call per ~40 shots that strips details the narration does not support
@@ -80,7 +80,12 @@ class Settings(BaseModel):
     max_source_duration: int = 3600
     max_age_years_soft: int = 6
     screen_top_k: int = 4
-    max_shots_per_source: int = 3
+    max_shots_per_source: int = 0     # per YouTube video; 0 = no limit (sections never overlap)
+    # hand fixes for single shots, applied over the planner's brief: {shot_id: {subject: ..., visual: ...,
+    # youtube_queries: [...], stock_queries: [...]}} - e.g. when no footage of the planned subject exists
+    brief_overrides: dict[int, dict] = Field(default_factory=dict)
+    # neighbouring shots may not take footage of one video closer than this (seconds); 0 = off
+    adjacent_source_gap: float = 30.0
     rounds_per_shot: int = 2
     # "storyboard": judge the video's seek-bar preview sheet (~12 s, ~3k tokens, any vision link);
     # "url": the judge watches the YouTube URL (~50 s, ~240k tokens, YouTube-capable links only).
@@ -98,8 +103,58 @@ class Settings(BaseModel):
     prefetch_ahead: int = 3          # shots whose judge-free work is prepared in the background (0 = off)
     screen_workers: int = 3
     judge_concurrency: int = 4        # max judge calls in flight at once, across all threads
+    # seconds before a slow judge call is hedged with the next link (first answer wins); 0 = off
+    judge_hedge_after: float = 0.0
+    # True = send the native Gemini link the clip as inline video (the old behaviour, slower and
+    # spikier); False = the same tiled frame grid every other link gets
+    direct_verify_video: bool = False
+    # reject a clip whose text stays pinned in place over moving footage, found by local OCR
+    # (inspect/overlay.py); needs the optional rapidocr-onnxruntime package, off without it
+    local_overlay_check: bool = True
+    # `provider: _heart` judge links (ChatGPT via the HeartCode CLI, see llm/heart.py):
+    # processes running at once, and seconds before one is killed
+    heart_concurrency: int = 2
+    heart_timeout: float = 90.0
+    # start the next screened candidate's section download while the current clip is still being
+    # cut and judged (a download is ~10 s of pure transfer, the judge call can be 20 s or more)
+    download_ahead: bool = True
+    # skip the dedicated AI-footage check on a clip that is already rejected on score (it can only
+    # lower the score further); run it later only if that clip is promoted to a weak match
+    defer_ai_check: bool = True
     # seconds to wait for a judge link to recover before giving a shot up as "unavailable"
     judge_patience: float = 60.0
+    # screened candidates whose best window scores below this (0-100) are tried only after the
+    # better ones of the round. Measured on the Philippines run (217 downloads): below 70 only 6 of
+    # 39 downloads became a usable clip, 80+ gave 55 of 154. A deferral, never a reject; 0 = off
+    screen_min_match: int = 70
+    # a shot that is the 2nd/3rd shot of one sentence first tries a different scene of the video
+    # its previous sibling used (no search, screening or download); 0 = off. The first shot's
+    # section is downloaded this many seconds longer so the sibling has footage to cut from
+    sibling_extend: float = 9.0
+    # judge links at the head of the chain used side by side (least expected wait first) instead
+    # of strictly in order; 1 = plain chain order
+    judge_lanes: int = 2
+    # copy every accepted clip into a shared library (`<cache_dir>/library`) and search it with
+    # CLIP before YouTube; a library clip skips search, screening and download, never the checks
+    library: bool = True
+    library_min_sim: float = 0.28     # CLIP text-image similarity to try a library clip (median for a
+    # clip and its own subject, measured on 112 clips; the AI verify still decides)
+    library_tries: int = 2
+    # a shot the planner marked `generic` (ordinary b-roll) tries stock before YouTube: no search,
+    # screening or AI-ban risk, and it keeps YouTube near 65-70% of the footage. False = YouTube first
+    stock_first: bool = True
+    # reusing earlier footage is the last resort before a weak match: a clip appears at most `reuse_max_uses`
+    # times in the video, `reuse_min_gap` seconds apart (timeline), never in neighbouring shots, and it is
+    # judged again against the new shot. 0 uses = never reuse
+    reuse_max_uses: int = 2
+    reuse_min_gap: float = 60.0
+    reuse_tries: int = 2
+    # export each accepted clip for Remotion as soon as it is accepted (1080p30, padded tail,
+    # optional baked look); None = off. See `ytauto export-remotion`
+    remotion_export: str | None = None
+    remotion_bake: bool = True
+    remotion_grain: str | None = None   # grain overlay video baked in (blend overlay), optional
+    remotion_dust: str | None = None    # particles-on-black video baked in (blend screen), optional
     title_blacklist: list[str] = Field(default_factory=lambda: [
         "ai generated", "ai-generated", "sora", "veo 3", "kling", "midjourney",
         "reaction", "podcast", "slideshow", "gameplay", "minecraft", "anime"])
@@ -121,6 +176,20 @@ class Settings(BaseModel):
     stock_tries_per_provider: int = 3
     # fallback order after YouTube
     fallback_order: list[str] = Field(default_factory=lambda: ["pexels", "pixabay", "coverr", "mixkit"])
+    # last resort for a shot nothing else fills: footage whose only defect is a small logo in one corner is
+    # re-cut `watermark_crop_zoom`x closer so the corner falls outside the picture, then judged again.
+    # Whether the footage may be reused at all (licence) stays the user's call; the source is in the ledger
+    watermark_crop: bool = True
+    watermark_crop_zoom: float = 1.15
+    # still images: the last resort for a shot no video fills (see sources/images.py, Selector._still).
+    # A still is judged like a clip (relevance, no watermark/text, not AI) and becomes a slow push-in,
+    # pull-out or pan clip. `still_share_warn` is a soft guide in % of running time, not a limit.
+    stills: bool = True
+    still_order: list[str] = Field(default_factory=lambda: ["pexels", "pixabay", "commons"])
+    still_min_relevance: float = 75.0   # stricter than clips: keyword-level matches are not enough
+    still_min_width: int = 2000        # px; a 12% push-in on a smaller picture goes soft
+    still_tries: int = 3               # pictures judged per shot, across all providers
+    still_share_warn: float = 10.0
     # qa
     qa_max_loops: int = 2
     # paths

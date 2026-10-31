@@ -21,8 +21,21 @@ def run_ffmpeg(args: list[str], timeout: int = 1800):
         raise FFmpegError(r.stderr[-800:])
 
 
-def vf_chain(s: Settings, stretch: float = 1.0) -> str:
+CORNERS = ("top-left", "top-right", "bottom-left", "bottom-right")
+
+
+def corner_crop(corner: str, zoom: float) -> str:
+    """ffmpeg crop that keeps the part of the frame away from `corner`, `zoom`x closer: a watermark
+    that sits within the outer (1 - 1/zoom) of that corner ends up outside the picture."""
+    x = "0" if corner.endswith("right") else f"iw-iw/{zoom}"
+    y = "0" if corner.startswith("bottom") else f"ih-ih/{zoom}"
+    return f"crop=iw/{zoom}:ih/{zoom}:{x}:{y}"
+
+
+def vf_chain(s: Settings, stretch: float = 1.0, crop: str | None = None) -> str:
     f = []
+    if crop:
+        f.append(crop)
     if abs(stretch - 1.0) > 1e-3:
         f.append(f"setpts=PTS*{stretch:.5f}")
     f += [f"scale={s.width}:{s.height}:force_original_aspect_ratio=increase:flags=lanczos",
@@ -30,7 +43,8 @@ def vf_chain(s: Settings, stretch: float = 1.0) -> str:
     return ",".join(f)
 
 
-def cut_clip(s: Settings, src: Path, start: float, dur: float, out: Path, avail: float | None = None) -> Path:
+def cut_clip(s: Settings, src: Path, start: float, dur: float, out: Path, avail: float | None = None,
+             crop: str | None = None) -> Path:
     """Cut `dur` seconds starting at `start` into the project spec (video only, exact frame count).
     If the source window is a little short (`avail` < dur, within 10%), slow it down to fit."""
     frames = max(1, round(dur * s.fps))
@@ -44,7 +58,7 @@ def cut_clip(s: Settings, src: Path, start: float, dur: float, out: Path, avail:
 
     def encode(stretch: float, read: float):
         run_ffmpeg(["-ss", f"{start:.3f}", "-i", str(src), "-t", f"{read + 0.2:.3f}", "-an",
-                    "-vf", vf_chain(s, stretch), "-frames:v", str(frames),
+                    "-vf", vf_chain(s, stretch, crop), "-frames:v", str(frames),
                     "-c:v", "libx264", "-preset", "medium", "-crf", str(s.crf), "-movflags", "+faststart", str(tmp)])
 
     encode(stretch, read)

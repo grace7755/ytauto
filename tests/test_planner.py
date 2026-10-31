@@ -343,3 +343,50 @@ def test_ai_topic_is_used_for_beats_that_name_nothing():
     gem = FakeJudge({"topic": "Iceland", "shots": []})      # no usable brief for the shot
     briefs = plan([seg], [sh], "My Channel Video", S, None, gem)
     assert "Iceland" in briefs[0].visual
+
+
+def test_the_setting_is_pinned_on_every_brief_and_placeless_queries():
+    from ytauto.models import Brief
+    from ytauto.planner import with_setting
+
+    b = with_setting(Brief(subject="Remote house", entities=["House", "village"],
+                           youtube_queries=["House 4k", "remote Alaskan village 4K"]),
+                     "Alaska", "This is not an emergency.")
+    assert b.setting == "Alaska"
+    assert b.youtube_queries == ["Alaska House 4k", "remote Alaskan village 4K"], "Alaskan already names it"
+    assert "Alaska" in b.names() and "not usable" in b.names()
+    assert with_setting(Brief(subject="x", youtube_queries=["q"]), "").youtube_queries == ["q"]
+
+
+def test_cache_keys_of_briefs_without_a_setting_do_not_change():
+    from ytauto.models import Brief
+
+    assert Brief(entities=["a", "b"]).key() == "a,b"
+    assert Brief(entities=["a"], setting="Alaska").key() == "a|Alaska"
+    assert Brief(entities=["a", "b"]).names() == "a, b"
+
+
+def test_queries_naming_a_place_from_the_narration_are_kept():
+    from ytauto.models import Brief
+    from ytauto.planner import with_setting
+
+    b = with_setting(Brief(entities=["Hakuba"], youtube_queries=["hakuba ski 4k", "powder snow 4k"]),
+                     "Japan", "Hakuba has some of the best powder snow.")
+    assert b.youtube_queries == ["hakuba ski 4k", "Japan powder snow 4k"]
+
+
+def test_a_config_brief_override_replaces_the_planned_brief(tmp_path, monkeypatch):
+    import ytauto.pipeline as P
+    from ytauto.config import Settings
+
+    t = tmp_path / "t.txt"
+    t.write_text("00:00-00:04 One.\n00:04-00:08 Two.", encoding="utf-8")
+    s = Settings(projects_dir=tmp_path / "p", cache_dir=tmp_path / "c", judge_chain=[],
+                 brief_overrides={1: {"subject": "cloudy sky", "youtube_queries": ["sky 4k"]}})
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    monkeypatch.setenv("HEART_CONFIG", "")
+    p = P.Pipeline(s, t, "Test")
+    p.prepare()
+    assert p.shots[1].brief.subject == "cloudy sky" and p.shots[1].brief.youtube_queries == ["sky 4k"]
+    assert p.shots[0].brief.subject != "cloudy sky"

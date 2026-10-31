@@ -15,10 +15,23 @@ def _toks(s: str) -> list[str]:
     return _W.findall(s.lower())
 
 
+def load_audio(audio: Path, sr: int = 16000):
+    """Mono float32 samples at `sr` via ffmpeg. faster-whisper's own decoder passes
+    `metadata_errors` to PyAV's open(), which current PyAV no longer accepts (TypeError), so
+    every `--vo` alignment silently fell back to the transcript timing."""
+    import subprocess
+
+    import numpy as np
+
+    r = subprocess.run(["ffmpeg", "-v", "error", "-i", str(audio), "-ac", "1", "-ar", str(sr),
+                        "-f", "f32le", "-"], capture_output=True, check=True)
+    return np.frombuffer(r.stdout, dtype=np.float32).copy()
+
+
 def transcribe_words(audio: Path, model_size: str = "base") -> tuple[list[tuple[str, float, float]], float]:
     from faster_whisper import WhisperModel
     model = WhisperModel(model_size, device="cpu", compute_type="int8")
-    segs, info = model.transcribe(str(audio), word_timestamps=True, vad_filter=True)
+    segs, info = model.transcribe(load_audio(audio), word_timestamps=True, vad_filter=True)
     words = []
     for sg in segs:
         for w in sg.words or []:

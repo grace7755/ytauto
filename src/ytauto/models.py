@@ -26,6 +26,27 @@ class Brief(BaseModel):
     youtube_queries: list[str] = Field(default_factory=list)
     stock_queries: list[str] = Field(default_factory=list)
     avoid: list[str] = Field(default_factory=list)
+    # Where the whole video is set ("Alaska"). The brief review strips the subject down to one
+    # filmable thing ("Remote house"), so without this the judge happily accepted a South Asian
+    # river town and a tropical stilt house for an Alaska documentary.
+    setting: str = ""
+    # Ordinary b-roll that any stock library has (open sea, aerial coast, crowd, sunset) and the
+    # narration names no specific place, person, event or landmark: stock is tried before YouTube
+    # (faster, licence-clean, no AI-footage ban risk). See `Settings.stock_first`.
+    generic: bool = False
+
+    def names(self) -> str:
+        """The prompts' "names involved" line, with the setting as a hard requirement."""
+        base = ", ".join(self.entities) or "-"
+        if not self.setting:
+            return base
+        return (f"{base}. Setting of the whole video: {self.setting} - the footage must plausibly be "
+                f"filmed there; a clearly different country, climate or culture is not usable "
+                f"(relevance at most 20)")
+
+    def key(self) -> str:
+        """Cache-key part for the names; unchanged for briefs without a setting."""
+        return ",".join(self.entities) + (f"|{self.setting}" if self.setting else "")
 
 
 class Shot(BaseModel):
@@ -43,7 +64,7 @@ class Shot(BaseModel):
 
 
 class Candidate(BaseModel):
-    provider: Literal["youtube", "pexels", "pixabay", "coverr", "mixkit"]
+    provider: Literal["youtube", "pexels", "pixabay", "coverr", "mixkit", "still_pexels", "still_pixabay", "still_commons"]
     source_id: str
     url: str
     title: str = ""
@@ -88,4 +109,5 @@ class Decision(BaseModel):
     score: ClipScore | None = None
     hard_rejects: list[str] = Field(default_factory=list)
     notes: str = ""
+    credit: str = ""                       # author of a still picture (for the credits list)
     ts: str = ""

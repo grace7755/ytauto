@@ -38,6 +38,7 @@ class Pipeline:
         self.shots: list[Shot] = []
         self.segments: list[Segment] = []
         self.quota_until: float | None = None    # set when the judge's daily quota paused the run
+        self.exporter = None                     # export.Exporter while a run exports for Remotion
 
     # ------------------------------------------------------------------
     def prepare(self):
@@ -55,6 +56,10 @@ class Pipeline:
         self.segments = segs
         self.shots = split_shots(segs, self.s.shot_target, self.s.shot_min, self.s.shot_max)
         briefs = plan(segs, self.shots, self.title, self.s, self.cache, self.gem)
+        for sid, upd in self.s.brief_overrides.items():
+            if sid in briefs:
+                briefs[sid] = briefs[sid].model_copy(update=upd)
+                log.info("shot %d: brief overridden by config (%s)", sid, ", ".join(upd))
         for sh in self.shots:
             sh.brief = briefs[sh.id]
         atomic_write(self.proj.path("metadata", "shots.json"), json.dumps([x.model_dump() for x in self.shots], indent=2))
@@ -114,6 +119,9 @@ class Pipeline:
                         f"not a footage problem; retry with `redo --shot {sh.id}` ({str(e)[:120]})")
             if d is None:
                 return f"shot {sh.id} ({sh.start:.0f}-{sh.end:.0f}s): no footage found; manual footage needed"
+            exporter = getattr(self, "exporter", None)
+            if exporter is not None:
+                exporter.submit(sh, d.clip_path)     # background: selection carries on
             return None
 
         workers = max(1, min(self.s.shot_workers, len(todo)))
@@ -125,8 +133,17 @@ class Pipeline:
             if workers == 1:
                 results = [one(sh) for sh in todo]
             else:
+                # The shots of one sentence go to the same worker, in order, so a 2nd shot can
+                # reuse its sibling's download (Selector._sibling); different sentences still run
+                # side by side.
+                groups: list[list[Shot]] = []
+                for sh in todo:
+                    if self.s.sibling_extend > 0 and groups and groups[-1][-1].segment == sh.segment:
+                        groups[-1].append(sh)
+                    else:
+                        groups.append([sh])
                 with ThreadPoolExecutor(workers) as ex:
-                    results = list(ex.map(one, todo))
+                    results = [r for g in ex.map(lambda g: [one(sh) for sh in g], groups) for r in g]
         finally:
             paused.set()                          # releases the prefetcher
             with cond:
@@ -165,6 +182,36 @@ class Pipeline:
         while (left := until - time.time()) > 0:
             time.sleep(min(left, 600))
 
+    def make_exporter(self, out_dir: Path | None = None):
+        """An `export.Exporter` for `remotion_export` (or `out_dir`), with the configured look."""
+        from .export import Exporter, Look
+
+        target = out_dir or (Path(self.s.remotion_export) if self.s.remotion_export else None)
+        if target is None:
+            return None
+        look = None
+        if self.s.remotion_bake:
+            look = Look(grain=Path(self.s.remotion_grain) if self.s.remotion_grain else None,
+                        dust=Path(self.s.remotion_dust) if self.s.remotion_dust else None)
+        return Exporter(target, look)
+
+    def _words_async(self, out_dir: Path) -> threading.Thread | None:
+        """Word timings for the captions, computed while the footage is being selected."""
+        if not self.vo:
+            return None
+        from .export import write_words
+
+        def work():
+            try:
+                with timing.stage("word timing"):
+                    write_words(self.vo, self.segments, out_dir / "words.json")
+            except Exception as e:                       # captions can be redone with export-remotion
+                log.warning("word timing failed: %s", str(e)[:200])
+
+        t = threading.Thread(target=work, name="words", daemon=True)
+        t.start()
+        return t
+
     def _run(self, wait: bool = False) -> dict:
         while True:
             try:
@@ -174,6 +221,8 @@ class Pipeline:
                 if not wait:
                     raise
                 self._sleep_until(e.until)
+        self.exporter = self.make_exporter()
+        words = self._words_async(self.exporter.dir) if self.exporter else None
         with timing.stage("select (wall)"):
             blockers = self.select_all()
             while self.quota_until and wait:
@@ -198,6 +247,12 @@ class Pipeline:
                     break
             if qa and not qa.passed:
                 blockers.append("QA still failing: " + "; ".join(qa.issues[:5]))
+        if self.exporter is not None:             # after QA: re-selected shots are exported too
+            with timing.stage("export (wait)"):
+                self.exporter.finish(self.shots)
+                if words:
+                    words.join()
+            self.exporter = None
         data = build(self.proj, self.title, self.shots, qa, blockers)
         data["quota_paused_until"] = self.quota_until
         log.info("report: %s", self.proj.path("report.html"))
@@ -206,7 +261,13 @@ class Pipeline:
     def redo(self, shot_id: int) -> dict:
         self.prepare()
         self.proj.invalidate(shot_id, "manual redo")
-        blockers = self.select_all(only={shot_id})
+        self.exporter = self.make_exporter()      # keeps an exported composition in step
+        try:
+            blockers = self.select_all(only={shot_id})
+        finally:
+            if self.exporter is not None:
+                self.exporter.finish(self.shots)
+            self.exporter = None
         video = self.render()
         qa = run_qa(self.s, self.proj, self.shots, video, self.shots[-1].end)
         return build(self.proj, self.title, self.shots, qa, blockers)
