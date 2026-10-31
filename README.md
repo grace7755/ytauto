@@ -255,7 +255,7 @@ grain/dust/filters (2.5x). Concurrency 10 (83 s) and `--gl=angle` (77 s) were sl
    cap), the voice+effects mix, and the rendered video's loudness and true peak.
 
 Measured/known limits: GL Transitions were tried and not adopted (see `VIDEO-PRODUCTION-GUIDE.md`).
-Everything above was checked with unit tests (270 pass) and one real check per feature; no before/after timing run.
+Everything above was checked with unit tests (all pass; see `tests/`) and one real check per feature; no before/after timing run.
 
 ## Round 4 (speed, one data-driven film, tidier code)
 

@@ -116,3 +116,23 @@ def test_sfx_audit_reads_the_plan_from_film_json(tmp_path):
     assert sfx.load(tmp_path / "sfx.json") == plan == sfx.load(tmp_path / "film.json")
     with pytest.raises(ValueError):
         sfx.load(tmp_path / "none.json")
+
+
+def test_a_title_or_place_in_another_script_still_works():
+    segs = [Segment(idx=0, start=0, end=8, text="ঢাকা শহরে"), Segment(idx=1, start=8, end=20, text="সুন্দরবন বনে বাঘ আছে")]
+    raw = [{"id": "s00", "clip": "a.mp4", "t0": 0.0, "t1": 8.0, "dur": 8.6}, {"id": "s01", "clip": "b.mp4", "t0": 8.0, "t1": 20.0, "dur": 12.6}]
+    facts = F.check_facts({"places": [{"segment": 1, "name": "সুন্দরবন", "sub": "বন"}], "chapters": []}, segs, "বাংলাদেশ")
+    f = F.build(slug="x", title="বাংলাদেশ", segments=segs, shots=raw, words=[], seconds=20.0, facts=facts)
+    assert [p["name"] for p in f["places"]] == ["সুন্দরবন".upper()], "an empty Latin-only form of the title must not drop every place"
+
+
+def test_a_film_is_refused_when_clips_are_missing_or_shots_leave_a_gap(tmp_path):
+    for n in ("a.mp4", "b.mp4"):
+        (tmp_path / n).write_bytes(b"x")
+    rows = [{"id": "s00", "clip": "a.mp4", "t0": 0.0, "t1": 4.0}, {"id": "s01", "clip": "b.mp4", "t0": 4.0, "t1": 8.0}]
+    assert F.check_complete(2, rows, tmp_path) == []
+    assert "3 shots but shots.json has 2" in F.check_complete(3, rows, tmp_path)[0]
+    (tmp_path / "b.mp4").unlink()
+    assert F.check_complete(2, rows, tmp_path) == ["b.mp4 is missing from " + str(tmp_path)]
+    gap = [rows[0], {"id": "s01", "clip": "a.mp4", "t0": 4.5, "t1": 8.0}]
+    assert "s00 ends at 4.0s but s01 starts at 4.5s" in F.check_complete(2, gap, tmp_path)[0]

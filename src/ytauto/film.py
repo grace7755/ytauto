@@ -69,8 +69,17 @@ Sentences:
 """
 
 
+_PUNCT = r"[\s.,;:!?\"'“”‘’()\[\]{}\-–—/%$&*_]"
+
+
 def _norm(s: str) -> str:
-    return re.sub(r"[^a-z0-9]", "", s.lower())
+    """The text without spaces and punctuation, lowercase - in any script (a title or place name need not be
+    Latin, and vowel marks of Indic scripts must stay attached to their letters)."""
+    return re.sub(_PUNCT, "", s.lower())
+
+
+def _words(s: str) -> list[str]:
+    return [w for w in re.split(_PUNCT, s) if w]
 
 
 def extract_facts(gem, segments: list[Segment], title: str, seconds: float) -> dict:
@@ -92,7 +101,7 @@ def _spell(name: str, vocab: list[str]) -> str:
     """The place name written as the narration spells it ("TUBATAHA" -> "TUBBATAHA"), or "" when a word of it
     is nowhere in the narration (an invented place). The AI mis-spells rare names; the narration is the truth."""
     out = []
-    for tok in re.findall(r"\w+", name):
+    for tok in _words(name):
         if tok.lower() in vocab:
             out.append(tok)
         else:
@@ -112,7 +121,7 @@ def check_facts(raw: dict, segments: list[Segment], title: str) -> dict:
         say = str(st.get("say") or "").strip()
         if seg and say and _norm(say) and _norm(say) in _norm(seg.text) and len(str(st.get("big") or "")) <= 10:
             stats.append({**st, "say": say})
-    vocab = sorted({w.lower() for w in re.findall(r"\w+", " ".join(s.text for s in segments) + " " + title)})
+    vocab = sorted({w.lower() for w in _words(" ".join(s.text for s in segments) + " " + title)})
     places = []
     for p in raw.get("places") or []:
         name = _spell(str(p.get("name") or ""), vocab)
@@ -171,6 +180,21 @@ def place_cards(facts: dict, segments: list[Segment], words: list[dict], seconds
     return stats, places, chapters
 
 
+def check_complete(shot_count: int, rows: list[dict], clips: Path) -> list[str]:
+    """Why shots.json cannot make a whole film: a shot of the project is missing from it (no clip exported), a
+    clip file is gone, or the shots do not run back to back (a gap would be black on screen)."""
+    out = []
+    if len(rows) != shot_count:
+        out.append(f"the project has {shot_count} shots but shots.json has {len(rows)} (run `ytauto export-remotion` again)")
+    for r in rows:
+        if not (clips / r["clip"]).exists():
+            out.append(f"{r['clip']} is missing from {clips}")
+    for a, b in zip(rows, rows[1:]):
+        if abs(b["t0"] - a["t1"]) > 0.06:
+            out.append(f"{a['id']} ends at {a['t1']}s but {b['id']} starts at {b['t0']}s")
+    return out
+
+
 def style_shots(raw_shots: list[dict], chapters: list[float]) -> list[dict]:
     out = []
     for i, s in enumerate(raw_shots):
@@ -205,7 +229,8 @@ def build(*, slug: str, title: str, segments: list[Segment], shots: list[dict], 
         title_card = {"at": at, "to": round(at + TITLE_SECONDS, 2), "kicker": "A DOCUMENTARY", "name": title.upper(),
                       "tagline": facts.get("tagline", "")}
     if title_card:      # a chip for the film's own subject would sit on the title card and say the same thing
-        places = [p for p in places if not (_norm(p["name"]) in _norm(title) or _norm(title) in _norm(p["name"]))
+        tn = _norm(title)
+        places = [p for p in places if not (tn and _norm(p["name"]) and (_norm(p["name"]) in tn or tn in _norm(p["name"])))
                   and not (title_card["at"] - 0.5 < p["at"] < title_card["to"])]
     end = {"at": round(max(seconds - 15.0, 0.0), 2), "kicker": "NEXT VIDEO", "title": next_video} if next_video else None
     styled = style_shots(shots, chapters)

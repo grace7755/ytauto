@@ -365,6 +365,11 @@ def film_cmd(project: Path = typer.Argument(..., help="A finished project folder
     clips = out / "clips"
     shots = json.loads((clips / "shots.json").read_text(encoding="utf-8"))
     words = json.loads((clips / "words.json").read_text(encoding="utf-8"))
+    n_shots = len(json.loads((project / "metadata" / "shots.json").read_text(encoding="utf-8")))
+    broken = F.check_complete(n_shots, shots, clips)
+    if broken:
+        typer.echo("film.json NOT written, the clips do not make a whole film:\n  " + "\n  ".join(broken))
+        raise typer.Exit(1)
     vo = out / "vo.mp3"
     info = probe(vo)
     seconds = info.duration if info else segs[-1].end
