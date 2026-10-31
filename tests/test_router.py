@@ -250,7 +250,10 @@ def test_mixkit_keyword_ladder_goes_specific_to_broad():
     (2, False, 3),    # nothing found -> broaden through the ladder
     (1, False, 3),    # partial failure -> keep trying
 ])
-def test_mixkit_honours_exit_codes(code, expect_blocked, expect_terms):
+def test_mixkit_honours_exit_codes(code, expect_blocked, expect_terms, monkeypatch):
+    import sys, types
+    # mixkit-dl is a separate local package CI does not install; available() only needs it importable
+    monkeypatch.setitem(sys.modules, "mixkit_dl", types.ModuleType("mixkit_dl"))
     from ytauto.config import Settings
     from ytauto.sources.stock import Mixkit
 
