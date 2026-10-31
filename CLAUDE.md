@@ -220,3 +220,18 @@ record those findings.
 - `lastresort.py` is the `LastResort` mixin of `Selector` (`_keep_for_crop`, `_crop_logo`, `_reuse`, `_still`, `_judge_made_clip`). Tests patch a name on both modules (`_patch` in `tests/test_production3.py`).
 - `film.py` + `ytauto film`: builds `film.json` (see the module docstring). `sfx.load` accepts a `film.json` as well as an `sfx.json`.
 - Remotion side: `D:\remotion\my-video\src\doc-kit\DocFilm.tsx` (registered once in `Root.tsx` as `DocFilm`, `--props='{"slug":"<slug>"}'`).
+
+
+## Working in Claude Code (moved back from Nibedita, 31 Oct 2026)
+
+**Two folders make up the system.** Run Claude Code from this folder; `.claude/settings.json` also opens `D:\remotion\my-video` (the Remotion project, own git repo, own `CLAUDE.md`) and `E:\1-MARKETING\yt-auto-test` (test films).
+
+**Make a film:** `/yt-film <transcript> <voice-over> "<title>" ["<next video title>"]` (`.claude/commands/yt-film.md`). It uses two subagents, `yt-film-maker` (stages footage and render) and `yt-video-reviewer` (`review-shots` + `redo`), in `.claude/agents/`. They replace the Nibedita agents and the `yt-film` workflow, which still exist in Nibedita but are not used. Full steps: `D:\remotion\my-video\VIDEO-PRODUCTION-GUIDE.md`, "One data-driven film".
+
+**Skills** are user-level (`~/.claude/skills`): `remotion-*`, `media-use`, `hyperframes-*`, `yt-script` and the other `yt-*` skills work here as they are. No skill was needed for ytauto itself: this file and the guide carry it.
+
+**Keys and tools:** `.env` here (Gemini, Pexels, Pixabay, Coverr, `HEART_CONFIG`) and `D:\remotion\my-video\.env` (ElevenLabs) are git-ignored; `.venv` and `node_modules` are in place. `ytauto doctor` checks keys, tools and the AI judge links; the ChatGPT judge link needs the `heart` CLI logged in.
+
+**Working style the owner asked for:** reply in simple words, keep answers short, put results first, never create automation scripts without asking, use agents (not scripts) for automation, do not run before/after timing tests unless asked, check a change yourself before saying it works, and say what failed.
+
+**Known limits:** age-restricted YouTube videos are skipped (reading them needs browser cookies, `cookies_from_browser`, not enabled). `ytauto redo` takes about 4 minutes per shot. Gemini free limits (15 requests per minute) are the footage-stage ceiling.

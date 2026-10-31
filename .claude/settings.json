@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "additionalDirectories": [
+      "D:\\remotion\\my-video",
+      "E:\\1-MARKETING\\yt-auto-test"
+    ],
+    "allow": [
+      "Bash(.venv/Scripts/ytauto:*)",
+      "Bash(.venv/Scripts/python -m pytest:*)",
+      "Bash(npx remotion:*)",
+      "Bash(npx tsc:*)",
+      "Bash(npx eslint:*)",
+      "Bash(ffprobe:*)",
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)"
+    ]
+  }
+}
