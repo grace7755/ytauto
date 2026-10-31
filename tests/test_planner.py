@@ -399,11 +399,11 @@ def test_presenter_words_are_stripped_from_youtube_queries():
 
     b = Brief(visual="v", subject="Glock 19", youtube_queries=[
         "Glock 19 review", "Glock 19 vs Sig P365 comparison", "Glock 19 slow motion 4k",
-        "Glock 19 b-roll review", "Talkeetna aerial"])
+        "Glock 19 b-roll review", "Talkeetna aerial", "Glock vs. Sig P365"])
     briefs = {0: b}
     fixed = _b_roll_queries(briefs)
     assert briefs[0].youtube_queries == ["Glock 19 b-roll", "Glock 19 Sig P365 b-roll",
-                                         "Glock 19 slow motion 4k", "Talkeetna aerial"]
-    assert len(fixed) == 3
+                                         "Glock 19 slow motion 4k", "Talkeetna aerial", "Glock Sig P365 b-roll"]
+    assert len(fixed) == 4
     clean = {1: Brief(visual="v", youtube_queries=["Kyoto temples 4k"])}
     assert _b_roll_queries(clean) == [] and clean[1].youtube_queries == ["Kyoto temples 4k"]

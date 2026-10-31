@@ -202,7 +202,7 @@ def primary_subject(b: Brief) -> str:
 # of 282 rejects were gun-review channels with a presenter on camera; each cost a storyboard screen or a
 # download plus a judge call. Only search wording changes - nothing about what is accepted.
 _PRESENTER_WORDS = re.compile(
-    r"\b(?:reviews?|unboxing|vs\.?|versus|comparison|first impressions?|tutorial|how to|explained|"
+    r"\bvs\b\.?|\b(?:reviews?|unboxing|versus|comparison|first impressions?|tutorial|how to|explained|"
     r"reaction|podcast|talk|interview|vlog)\b", re.I)
 
 
