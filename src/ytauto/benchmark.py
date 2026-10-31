@@ -25,13 +25,13 @@ def recency_score(c: Candidate, soft_years: int) -> float:
     return _clamp(100 - 12 * (age - soft_years / 2))   # soft penalty only; never a hard reject
 
 
-def evaluate(s: Settings, c: Candidate, info: MediaInfo | None, chk: CheckResult, verdict: dict | None,
-             prior_relevance: float = 0.0) -> tuple[ClipScore, list[str]]:
-    """verdict = AI verify dict (or None in offline mode). prior_relevance = text/screen match 0-100."""
-    rejects: list[str] = []
-
+def local_rejects(s: Settings, info: MediaInfo | None, chk: CheckResult) -> list[str]:
+    """The hard rejects the free local checks can decide alone (no AI verdict, no score): an unreadable,
+    low-resolution, black-and-white, black, frozen, blurry, letterboxed or presenter-sized-face clip. A clip
+    with any of these is rejected whatever the judge would say, so it is not sent to the judge."""
     if info is None or chk.n_frames == 0:
-        return ClipScore(), ["unreadable clip"]
+        return ["unreadable clip"]
+    rejects: list[str] = []
 
     # ---- deterministic hard rejects -----------------------------------
     if info.height < s.min_clip_height:
@@ -48,6 +48,16 @@ def evaluate(s: Settings, c: Candidate, info: MediaInfo | None, chk: CheckResult
         rejects.append(f"letterboxed ({chk.letterbox:.0%} black bars)")
     if chk.face > s.max_face_ratio:
         rejects.append(f"large face on screen ({chk.face:.0%} of frame) - likely presenter")
+    return rejects
+
+
+def evaluate(s: Settings, c: Candidate, info: MediaInfo | None, chk: CheckResult, verdict: dict | None,
+             prior_relevance: float = 0.0) -> tuple[ClipScore, list[str]]:
+    """verdict = AI verify dict (or None in offline mode). prior_relevance = text/screen match 0-100."""
+    if info is None or chk.n_frames == 0:
+        return ClipScore(), ["unreadable clip"]
+    rejects = local_rejects(s, info, chk)
+
     # NOTE: chk.overlay is a weak hint only (it misses translucent watermarks and fires on static
     # scenery), so it never hard-rejects. Real overlays are caught by the AI judge's text_overlay /
     # watermark_or_logo flags below; here it only costs the clip some cleanliness score.

@@ -87,6 +87,8 @@ class Settings(BaseModel):
     # neighbouring shots may not take footage of one video closer than this (seconds); 0 = off
     adjacent_source_gap: float = 30.0
     rounds_per_shot: int = 2
+    # clips downloaded and judged per shot in one select() before YouTube is given up (0 = no budget); see Selector._over_budget
+    max_downloads_per_shot: int = 8
     # "storyboard": judge the video's seek-bar preview sheet (~12 s, ~3k tokens, any vision link);
     # "url": the judge watches the YouTube URL (~50 s, ~240k tokens, YouTube-capable links only).
     # "storyboard_only": as storyboard, but a video without one is skipped instead of URL-screened
@@ -162,7 +164,7 @@ class Settings(BaseModel):
     min_score: float = 70
     min_relevance: float = 60
     min_clip_height: int = 1080
-    blur_threshold: float = 60.0       # Laplacian variance (on 1080p-normalised frame)
+    blur_threshold: float = 40.0       # Laplacian variance (on 1080p-normalised frame); 60 rejected good soft/underwater clips
     min_saturation: float = 0.06       # mean HSV S (0-1); below = B&W
     max_black_ratio: float = 0.15
     max_face_ratio: float = 0.12       # face area / frame area -> talking head

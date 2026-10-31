@@ -26,6 +26,7 @@ reuse_max_uses: 2
 reuse_min_gap: 60
 reuse_tries: 2          # earlier clips (best CLIP match first) judged for the new shot
 rounds_per_shot: 2      # fresh-query retries on YouTube before stock fallback
+max_downloads_per_shot: 8  # then stop downloading for the shot: stock, still, reuse, weak (Philippines: 14 shots took 8+, 10 of them ended weak). 0 = off
 
 # ---- speed ------------------------------------------------------------------
 # storyboard: judge the video's seek-bar preview sheet (~12 s, ~3k tokens per candidate)
@@ -48,7 +49,10 @@ stock_first: true       # shots the planner marks `generic` (open sea, aerial co
 
 min_score: 70           # benchmark pass mark (0-100)
 min_relevance: 60       # hard floor on relevance sub-score
-blur_threshold: 60
+# Laplacian variance on a 1080p frame. 60 rejected good underwater and drone footage: of the 18 Philippines clips
+# rejected between 40 and 59, 9 were rated relevant (70-100) by the judge, "good quality, slightly soft". Below 40 the
+# judge's own verdicts were wrong-subject or synthetic. The total-score gate (min_score) still guards quality.
+blur_threshold: 40
 min_saturation: 0.06
 max_face_ratio: 0.12
 

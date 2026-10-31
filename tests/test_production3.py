@@ -433,3 +433,83 @@ def test_still_queries_start_with_the_place(tmp_path, monkeypatch):
     prov.search = lambda q, n: asked.append(q) or []
     sel._still(sh)
     assert asked[0] == "coral reef Philippines"
+
+
+# --- the judge is not asked about clips the free checks already reject ---------------------------
+def _try_case(tmp_path, monkeypatch, blur):
+    import ytauto.select as SEL
+    sh = Shot(id=1, segment=0, start=0, end=4, text="x", brief=Brief(subject="reef", setting="Philippines"))
+    sel, proj = _sel(tmp_path, [sh])
+    sel.gem = object()
+    calls = []
+    info = MediaInfo(width=1920, height=1080, duration=30.0, fps=30, has_audio=False, codec="h264")
+    monkeypatch.setattr(SEL, "probe", lambda p: info)
+    monkeypatch.setattr(SEL, "best_window", lambda *a, **k: (2.0, 9.0, True))
+    monkeypatch.setattr(SEL, "cut_clip", lambda s, src, a, want, out, avail=None, crop=None: out.write_bytes(b"x"))
+    monkeypatch.setattr(SEL, "run_checks", lambda p: CheckResult(blur=blur, saturation=0.4, n_frames=3))
+    monkeypatch.setattr(SEL.overlay, "available", lambda: False)
+    monkeypatch.setattr(SEL, "verify_clip", lambda *a, **k: calls.append(1) or dict(GOOD))
+    c = Candidate(provider="pexels", source_id="p", url="u")
+    d, _ = sel._try_file(sh, c, tmp_path / "src.mp4", None, 80.0, 0.0)
+    return d, calls
+
+
+def test_a_blurry_clip_is_not_sent_to_the_judge_but_keeps_the_ai_question_for_a_weak_match(tmp_path, monkeypatch):
+    d, calls = _try_case(tmp_path / "a", monkeypatch, blur=10)
+    assert calls == [] and d.status == "rejected" and d.hard_rejects[0].startswith("too blurry")
+    assert "[AI check deferred]" in d.notes
+
+
+def test_a_sharp_clip_is_still_judged(tmp_path, monkeypatch):
+    d, calls = _try_case(tmp_path / "b", monkeypatch, blur=300)
+    assert calls == [1] and d.status == "accepted"
+
+
+def test_local_rejects_lists_only_what_the_free_checks_decide():
+    from ytauto.benchmark import local_rejects
+    s = Settings()
+    info = MediaInfo(width=1280, height=720, duration=3, fps=30, has_audio=False, codec="h264")
+    r = local_rejects(s, info, CheckResult(blur=5, saturation=0.4, n_frames=3, letterbox=0.2))
+    assert [x.split(" ")[0] for x in r] == ["resolution", "too", "letterboxed"]
+    assert local_rejects(s, None, CheckResult()) == ["unreadable clip"]
+    assert local_rejects(s, MediaInfo(width=1920, height=1080, duration=3, fps=30, has_audio=False, codec="h"),
+                         CheckResult(blur=300, saturation=0.4, n_frames=3)) == []
+
+
+def test_blur_limit_lets_slightly_soft_footage_reach_the_judge_but_not_mush():
+    from ytauto.benchmark import local_rejects
+    s = Settings()
+    info = MediaInfo(width=1920, height=1080, duration=3, fps=30, has_audio=False, codec="h")
+    assert local_rejects(s, info, CheckResult(blur=45, saturation=0.4, n_frames=3)) == []
+    assert local_rejects(s, info, CheckResult(blur=35, saturation=0.4, n_frames=3))[0].startswith("too blurry")
+
+
+# --- download budget -----------------------------------------------------------------------------
+def test_a_shot_stops_downloading_after_its_budget_but_screen_rejects_are_free(tmp_path):
+    sh = Shot(id=3, segment=0, start=0, end=4, text="x", brief=Brief(subject="reef"))
+    sel, proj = _sel(tmp_path, [sh], max_downloads_per_shot=3)
+    sel._dl_base[3] = 0
+    for i in range(5):
+        proj.log_decision(Decision(shot=3, status="rejected", provider="youtube", source_id=f"s{i}", url="u",
+                                   hard_rejects=["screen: not usable - wrong place"]))
+    assert sel._downloads(sh) == 0 and not sel._over_budget(sh)
+    for i in range(3):
+        proj.log_decision(Decision(shot=3, status="rejected", provider="youtube", source_id=f"d{i}", url="u",
+                                   hard_rejects=["too blurry (sharpness 10 < 40)"]))
+    assert sel._downloads(sh) == 3 and sel._over_budget(sh)
+    sel.s.max_downloads_per_shot = 0
+    assert not sel._over_budget(sh), "0 switches the budget off"
+
+
+def test_the_budget_counts_from_the_start_of_each_select_so_redo_works(tmp_path, monkeypatch):
+    sh = Shot(id=3, segment=0, start=0, end=4, text="x", brief=Brief(subject="reef"))
+    sel, proj = _sel(tmp_path, [sh], max_downloads_per_shot=2)
+    for i in range(4):
+        proj.log_decision(Decision(shot=3, status="rejected", provider="youtube", source_id=f"d{i}", url="u",
+                                   hard_rejects=["relevance 10 < 60"]))
+    sel._sibling = sel._from_library = sel._crop_logo = sel._still = sel._reuse = lambda *a, **k: None
+    seen = []
+    sel._youtube = lambda shot, best: seen.append(sel._over_budget(shot))
+    sel._stock = lambda shot, best: None
+    sel.select(sh)
+    assert seen == [False], "4 old rejects must not use up the budget of a new select"

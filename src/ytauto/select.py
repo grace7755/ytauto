@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from .assemble import CORNERS, corner_crop, cut_clip, tail_for
-from .benchmark import evaluate
+from .benchmark import evaluate, local_rejects
 from .cache import Cache
 from .config import Settings
 from .inspect import overlay
@@ -55,6 +55,7 @@ class Selector:
         self._index = None                       # CLIP tile index, loaded on first use
         self._index_failed = False
         self._wm: dict[int, list[dict]] = defaultdict(list)   # per shot: footage whose only defect is a corner logo
+        self._dl_base: dict[int, int] = {}      # downloads already on a shot's ledger when this select() began
         self._reusing: set[tuple] = set()      # clips being reused right now (never more than reuse_max_uses)
         self._photos = None                     # still-picture providers, built on first use
         self._dl_pool: ThreadPoolExecutor | None = None   # background section downloads (download_ahead)
@@ -254,7 +255,12 @@ class Selector:
                 self._note_defects(c, [why])
                 return d, out
         verdict = None
-        judged = self.gem and self.s.use_gemini_verify and not chk.frozen
+        # A clip the free local checks already reject is rejected whatever the judge says (measured on the
+        # Philippines run: 81 of 347 judge calls went to clips that had already failed blur, letterbox,
+        # resolution or face), so it never reaches the judge. If it is later promoted to a weak match the
+        # AI-footage question is still asked then (AI_DEFERRED).
+        local = local_rejects(self.s, out_info, chk)
+        judged = self.gem and self.s.use_gemini_verify and not local
         if judged:
             # A clip already rejected on score gains nothing from the dedicated AI check (it can
             # only lower the score); measured, ~1 in 5 downloaded clips failed exactly that way.
@@ -275,6 +281,8 @@ class Selector:
             # local checks alone must never accept a clip while a judge is configured.
             rejects.append("AI verify gave no verdict")
         note = f"blur={chk.blur:.0f} sat={chk.saturation:.2f} face={chk.face:.2f} overlay={chk.overlay:.2f}"
+        if local and self.gem and self.s.use_gemini_verify:
+            note += " | not sent to the judge: failed a local check" + AI_DEFERRED
         if verdict:
             note += " | " + (verdict.get("notes") or "")[:200]
             if verdict.get("ai_check_deferred"):
@@ -570,9 +578,25 @@ class Selector:
                     if sb is not None:
                         idx.tiles(sb)
 
+    def _downloads(self, shot: Shot) -> int:
+        """Clips downloaded and judged for this shot so far (screen-only rejects cost no download)."""
+        return sum(1 for d in self.proj.ledger() if d.shot == shot.id and d.status in ("accepted", "rejected", "weak")
+                   and not any(r.startswith("screen") for r in d.hard_rejects))
+
+    def _over_budget(self, shot: Shot) -> bool:
+        """Has this select() already spent `max_downloads_per_shot` downloads on the shot? Measured on the
+        Philippines run: 14 of 87 shots took more than 8 downloads (up to 25), and 10 of those 14 still ended as
+        weak matches - the extra downloads bought nothing. Past the budget the shot moves on to stock, a still,
+        a reuse or a weak match. 0 = no budget."""
+        cap = self.s.max_downloads_per_shot
+        return cap > 0 and self._downloads(shot) - self._dl_base.get(shot.id, 0) >= cap
+
     def _youtube(self, shot: Shot, best: list) -> Decision | None:
         tried = self._tried(shot)
         for rnd in range(self.s.rounds_per_shot):
+            if self._over_budget(shot):
+                log.info("shot %d: %d downloads without a usable clip; leaving YouTube", shot.id, self.s.max_downloads_per_shot)
+                break
             cands = self._youtube_candidates(shot, rnd)[: self.s.screen_top_k * 3]
             # Metadata is a ~2 s network call per video, independent of the others.
             with stage("metadata"):
@@ -629,6 +653,10 @@ class Selector:
                 if window is None:
                     continue                             # every window is taken or already tried
                 (window, prior) = window
+                if self._over_budget(shot):
+                    self._release(key, window)
+                    log.info("shot %d: download budget spent; leaving YouTube", shot.id)
+                    return None
                 try:
                     with stage("download"):
                         path = self.yt.download_section(c, window[0], window[1] + self._extend(shot),
@@ -972,6 +1000,7 @@ class Selector:
         if have:
             return have
         best: list[Decision] = []
+        self._dl_base[shot.id] = self._downloads(shot)
         d = self._sibling(shot) or self._from_library(shot)
         if not d:
             if shot.brief is not None and shot.brief.generic and self.s.stock_first:
