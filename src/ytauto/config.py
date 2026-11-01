@@ -114,6 +114,9 @@ class Settings(BaseModel):
     # processes running at once, and seconds before one is killed
     heart_concurrency: int = 2
     heart_timeout: float = 90.0
+    # `provider: _codex` judge links (ChatGPT plan via OpenAI's Codex CLI, see llm/codex.py)
+    codex_concurrency: int = 2
+    codex_timeout: float = 120.0
     # start the next screened candidate's section download while the current clip is still being
     # cut and judged (a download is ~10 s of pure transfer, the judge call can be 20 s or more)
     download_ahead: bool = True

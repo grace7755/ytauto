@@ -25,6 +25,7 @@ from .. import timing
 from ..config import JudgeLink, Settings
 from ..inspect.grid import extract_grid_data_url, grid_hint
 from ..log import log
+from .codex import CODEX, CodexClient, CodexError, is_limit as codex_limit
 from .gemini import Gemini, GeminiError
 from .heart import HEART, HeartClient, HeartError
 from .providers import DIRECT, ProviderConfig
@@ -200,6 +201,7 @@ class Judge:
         self._quota_down: dict[str, float] = {}     # links out of their daily quota
         self._direct: Gemini | None = None
         self._heart: HeartClient | None = None
+        self._codex: CodexClient | None = None
         self.quota = Quota(cache)
         self._direct_lock = threading.Lock()
         # One cap on in-flight judge calls across all shot and screening threads: provider rate
@@ -225,6 +227,8 @@ class Judge:
             return bool(self.s.gemini_key)
         if link.provider == HEART:
             return self._heart_client().installed
+        if link.provider == CODEX:
+            return self._codex_client().installed
         if not self.cfg.has(link.provider):
             return False
         return True
@@ -287,8 +291,23 @@ class Judge:
                 self._heart = HeartClient(self.s.heart_concurrency, self.s.heart_timeout)
             return self._heart
 
+    def _codex_client(self) -> CodexClient:
+        with self._direct_lock:
+            if self._codex is None:
+                self._codex = CodexClient(self.s.codex_concurrency, self.s.codex_timeout)
+            return self._codex
+
     def _post(self, link: JudgeLink, content: list[dict], schema: dict | None,
               timeout: float = TIMEOUT) -> str:
+        if link.provider == CODEX:          # ChatGPT plan through the Codex CLI (see llm/codex.py)
+            try:
+                text = self._codex_client().ask(link.model, content, min(timeout, self.s.codex_timeout))
+            except CodexError as e:
+                # a plan limit is a spent quota, not a failure: the run pauses instead of failing shots
+                raise JudgeError(f"HTTP 429: exceeded your current quota (ChatGPT plan limit): {str(e)[:200]}"
+                                 if codex_limit(str(e)) else str(e)) from e
+            self.calls += 1
+            return text
         if link.provider == HEART:          # ChatGPT through the HeartCode CLI (see llm/heart.py)
             try:
                 text = self._heart_client().ask(link.model, content, min(timeout, self.s.heart_timeout))

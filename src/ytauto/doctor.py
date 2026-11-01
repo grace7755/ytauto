@@ -61,6 +61,12 @@ def check_optional(s: Settings) -> list[Check]:
     if any(l.provider == "_heart" for l in s.judge_chain):
         cmd = command()
         out.append(("HeartCode (ChatGPT)", cmd is not None, " ".join(cmd)[:70] if cmd else "heart not installed"))
+    if any(l.provider == "_codex" for l in s.judge_chain):
+        from .llm.codex import command as codex_command
+
+        cmd = codex_command()
+        out.append(("Codex (ChatGPT plan)", cmd is not None,
+                    " ".join(cmd)[:70] if cmd else "codex not installed; then run `codex login`"))
     for name, key in (("Pexels key", s.pexels_key), ("Pixabay key", s.pixabay_key), ("Coverr key", s.coverr_key)):
         out.append((name, bool(key), "set" if key else "missing - that stock fallback is skipped"))
     return out

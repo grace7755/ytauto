@@ -90,6 +90,10 @@ judge_chain:
   - {provider: _heart,       model: "chatgpt gpt-6-luna",              vision: true}
   - {provider: _direct,      model: "gemini-3.5-flash-lite",           vision: true, youtube: true, rpm: 15}
   - {provider: _direct,      model: "gemini-flash-lite-latest",        vision: true, youtube: true, rpm: 15}
+  # OPTIONAL, off by default: ChatGPT through OpenAI's Codex CLI (llm/codex.py), signed in with `codex login`
+  # (your ChatGPT plan, no API key). A plan has a message limit per few hours, so try it as an extra link
+  # first and check `ytauto quota` against ChatGPT Settings before relying on it. Uncomment to enable:
+  # - {provider: _codex,       model: "gpt-5",                          vision: true}
   # Fallback: providers from $HEART_CONFIG (another project's file; read, never written).
   - {provider: geminiopenai, model: "models/gemini-2.5-flash-lite",   vision: true, youtube: true, rpm: 15}
   - {provider: geminiopenai, model: "models/gemini-flash-lite-latest", vision: true, youtube: true, rpm: 15}
