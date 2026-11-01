@@ -164,12 +164,24 @@ class Pipeline:
         elapsed = time.time() - t0
         timing.write(self.proj.path("logs", name), elapsed)
         log.info(timing.summary(elapsed))
+        gem = getattr(self, "gem", None)
+        if gem is not None and hasattr(gem, "link_stats"):
+            stem = name.rsplit(".", 1)[0].replace("timings", "judge-links")
+            atomic_write(self.proj.path("logs", f"{stem}.json"), json.dumps(gem.link_stats(), indent=2))
+
+    def _next_redo(self) -> int:
+        """1 for the first redo of a project, then 2, 3... (each keeps its own timings file)."""
+        n = 1
+        while self.proj.path("logs", f"timings-redo-{n}.json").exists():
+            n += 1
+        return n
 
     def run(self, wait: bool = False) -> dict:
         """`wait`: when the judge's daily quota runs out, sleep until it resets and carry on,
         instead of returning with the remaining shots paused."""
         t0 = time.time()
         timing.reset()
+        self.proj.run_label = "run"
         try:
             return self._run(wait)
         finally:
@@ -283,6 +295,8 @@ class Pipeline:
         ids = [shot_ids] if isinstance(shot_ids, int) else list(dict.fromkeys(shot_ids))
         t0 = time.time()
         timing.reset()
+        n = self._next_redo()
+        self.proj.run_label = f"redo-{n}"
         try:
             self.prepare()
             bad = [i for i in ids if i not in {sh.id for sh in self.shots}]
@@ -302,4 +316,5 @@ class Pipeline:
             qa = self._render_and_qa()
             return build(self.proj, self.title, self.shots, qa, blockers)
         finally:
-            self._finish_timing(t0, "timings-redo.json")   # never overwrites the run's own timings
+            # one file per redo: video-4 lost the timings of redo 1 and 2 when each redo overwrote one file
+            self._finish_timing(t0, f"timings-redo-{n}.json")

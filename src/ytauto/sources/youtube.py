@@ -31,8 +31,14 @@ _GONE = ("video is not available", "private video", "video unavailable", "has be
 
 
 def is_gone(err: str) -> bool:
-    """A permanent "this video is gone" error, as opposed to a network or bot-check failure."""
+    """A permanent "this video is gone" error, as opposed to a network or bot-check failure.
+
+    "Sign in to confirm your age" is permanent too: without browser cookies (`cookies_from_browser`, off) an
+    age-restricted video can never be read. It shares its prefix with the transient bot check ("Sign in to
+    confirm you're not a bot"), so it was never remembered: one video was looked up 62 times in one film."""
     low = err.lower()
+    if "confirm your age" in low:
+        return True
     return any(g in low for g in _GONE) and "sign in to confirm" not in low
 
 

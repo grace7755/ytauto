@@ -225,7 +225,7 @@ record those findings.
 ## Round 5: speed (31 Oct 2026)
 
 Measured baseline (5-guns film, 141 min): selection 76, 12 one-at-a-time redos 39, two Remotion renders 18.
-- `redo --shot 3,7,12` runs every shot in ONE process (one `prepare`, `shot_workers` side by side, one export, one QA) and writes `logs/timings-redo.json`.
+- `redo --shot 3,7,12` runs every shot in ONE process (one `prepare`, `shot_workers` side by side, one export, one QA) and writes `logs/timings-redo-<n>.json` (one file per redo).
 - `ffmpeg_render: auto` (default): with `remotion_export` set, `run`/`redo` skip the ffmpeg `final.mp4` and its QA, which the Remotion workflow never used. `qa.run_qa_clips` keeps the ledger, duplicate and contact-sheet checks on the clips. `ffmpeg_render: always` brings the old behaviour back (needed by `ytauto finish`).
 - `judge_spill_after: 3`: a link whose per-minute bucket would block longer is skipped for the next live link (`Quota.acquire(max_wait=)` returns None); a call waits only when every link is busy. Blocking waits show as `judge wait` in `timings.json`. 0 = old behaviour.
 - `storyboard_face_check` (default OFF): local Haar on the picked storyboard tiles; a face tile goes last and an all-face video is `face_suspect` (held back like `overlay_suspect`). Never a reject. Turn on only if `scripts/measure_face_tiles.py` says so on your ledgers.
@@ -233,6 +233,15 @@ Measured baseline (5-guns film, 141 min): selection 76, 12 one-at-a-time redos 3
 - `llm/codex.py` + `provider: _codex`: OpenAI's Codex CLI (`codex exec`, signed in with `codex login`, ChatGPT plan) as a judge link, written from `codex exec --help` of codex-cli 0.166.0. Prompt on stdin (never positional: `-i` swallows it), pictures as `--image` files, answer from `-o`. A plan-limit message becomes a quota 429, so the run pauses. OFF by default (a commented line in `default.yaml`): Plus allows few messages per few hours, so measure calls per film first. HeartCode (`_heart`) is unchanged. Tests: `tests/test_codex.py`.
 - `transcript.join_cut_sentences` (run by `load_transcript`): a cue that stops mid-sentence (subtitle tools cut at a time limit, e.g. ElevenLabs 6 s) is joined to the next. Measured on a 7:33 voice-over: 99 cues / 130 shots (87 under 3 s, shortest 0.26 s) became 81 cues / 113 shots (shortest 1.58 s). Guards: only when 70% of cues already end in . ? !, and a join never passes 20 s, so scripts without end punctuation are untouched. Export subtitles with 90 chars / 2 lines / 6 s.
 - Tests: `tests/test_redo_batch.py`, spill tests in `tests/test_quota.py`, face-tile tests in `tests/test_storyboard.py`.
+
+## Round 6: video-4 fixes (1 Nov 2026)
+
+Video-4 (Russian firearms, 127 shots) took 4 h 09 min: 1,636 first-pass attempts, half on stock and stills; the judge never waited.
+Plan (A: stop wasted searching, B: footage -> photo -> category -> graphic ladder, C: GPT Luna first). Done so far:
+- `Mixkit.keyword_ladder` no longer ends on an unconditional "nature": every gun shot fell through to it and one waterfall clip was judged for 55 shots (Mixkit 1 accepted / 227).
+- `youtube.is_gone` treats "Sign in to confirm your age" as permanent (cached in `yt_gone`); the bot check ("not a bot") stays transient. One ID was looked up 62 times.
+- `Decision.run` ("run" / "redo-<n>") on every ledger row; `logs/timings-redo-<n>.json` and `logs/judge-links*.json` (answers per judge link) per pass.
+- `scripts/measure_attempts.py <project> [--before ISO | --run run]`: yield per provider, stock items tried on many shots, what the film-wide stock skip and a per-shot attempt cap would save and lose. Thresholds for those fixes come from its output.
 
 ## Working in Claude Code (moved back from Nibedita, 31 Oct 2026)
 

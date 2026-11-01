@@ -212,6 +212,7 @@ class Judge:
         self._inflight: dict[str, int] = {}          # calls running per link (see _lanes)
         self._inflight_lock = threading.Lock()
         self.calls = 0
+        self.answers: dict[str, int] = {}            # answers per link (logs/judge-links.json)
         self.tokens = 0
 
         self.chain: list[JudgeLink] = [l for l in settings.judge_chain if self._usable(l)]
@@ -475,7 +476,19 @@ class Judge:
 
         return sorted(head, key=wait) + rest       # stable: chain order breaks ties
 
+    def _answered(self, link: JudgeLink):
+        tag = self._tag(link)
+        with self._inflight_lock:
+            self.answers[tag] = self.answers.get(tag, 0) + 1
+
+    def link_stats(self) -> dict:
+        """Which link answered how many calls, and which links are down right now (written per run)."""
+        with self._inflight_lock:
+            answers = dict(sorted(self.answers.items(), key=lambda kv: -kv[1]))
+        return {"answers": answers, "down": self.down_links(), "calls": self.calls}
+
     def _note_latency(self, link: JudgeLink, secs: float):
+        self._answered(link)
         tag = self._tag(link)
         old = self._latency.get(tag)
         self._latency[tag] = secs if old is None else 0.7 * old + 0.3 * secs
@@ -731,6 +744,7 @@ class Judge:
             except (JudgeError, GeminiError, ValueError, json.JSONDecodeError) as e:
                 self._trip(link, str(e))
                 continue
+            self._answered(link)
             if cache_key is not None:
                 self.cache.set("judge", data, *cache_key)
             return bool(data.get("ai_generated"))

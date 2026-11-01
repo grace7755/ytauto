@@ -72,8 +72,36 @@ def test_redo_selects_all_shots_in_one_pass_and_skips_the_unused_render(tmp_path
     assert calls["invalidated"] == [2, 0]
     assert calls["render"] == 0, "no ffmpeg final.mp4 in the Remotion workflow"
     assert data["qa"].info["mode"].startswith("clips")
-    assert (p.proj.root / "logs" / "timings-redo.json").exists()
+    assert (p.proj.root / "logs" / "timings-redo-1.json").exists()
     assert not (p.proj.root / "logs" / "timings.json").exists(), "the run's own timings are kept"
+    assert p.proj.run_label == "redo-1"
+    p.redo([1])
+    assert (p.proj.root / "logs" / "timings-redo-2.json").exists(), "each redo keeps its own timings (video-4 lost two)"
+    assert (p.proj.root / "logs" / "timings-redo-1.json").exists()
+    assert p.proj.run_label == "redo-2"
+
+
+def test_every_ledger_row_says_which_pass_logged_it(tmp_path):
+    proj = Project(tmp_path / "proj")
+    proj.run_label = "redo-3"
+    proj.log_decision(Decision(shot=0, status="rejected", provider="pexels", source_id="1", url="u"))
+    assert proj.ledger()[0].run == "redo-3"
+    # old ledgers without the field still load
+    (tmp_path / "old.jsonl").write_text('{"shot":1,"status":"accepted","provider":"youtube","source_id":"v","url":"u"}\n')
+    assert Decision.model_validate_json((tmp_path / "old.jsonl").read_text().strip()).run == ""
+
+
+def test_judge_links_are_written_next_to_the_timings(tmp_path):
+    p = _pipe(tmp_path)
+
+    class G:
+        def link_stats(self):
+            return {"answers": {"_heart/chatgpt gpt-6-luna": 3}, "down": {}, "calls": 3}
+    p.gem = G()
+    import time as _t
+    p._finish_timing(_t.time(), "timings-redo-2.json")
+    import json as _j
+    assert _j.loads((p.proj.root / "logs" / "judge-links-redo-2.json").read_text())["answers"]["_heart/chatgpt gpt-6-luna"] == 3
 
 
 def test_redo_refuses_unknown_shot_ids_before_touching_the_ledger(tmp_path):

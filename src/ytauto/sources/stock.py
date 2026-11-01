@@ -221,7 +221,10 @@ class Mixkit(Provider):
             broad = MIXKIT_BROAD.get(w.lower())
             if broad:
                 add(broad)
-        add("nature")                           # last resort: a category that always has clips
+        # No unconditional last resort. It used to end on "nature" ("a category that always has clips"), which
+        # suits travel films but nothing else: on the Russian-firearms film every gun shot fell through to it and
+        # the same waterfall clip was fetched, cut and AI-judged for 55 different shots (Mixkit: 1 accepted in 227).
+        # A shot that really wants nature names it ("sea", "forest", "lake" -> MIXKIT_BROAD above).
         return ladder
 
     def _run_cli(self, term: str, n: int) -> tuple[int, dict]:

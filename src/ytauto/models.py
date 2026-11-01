@@ -111,3 +111,4 @@ class Decision(BaseModel):
     notes: str = ""
     credit: str = ""                       # author of a still picture (for the credits list)
     ts: str = ""
+    run: str = ""                          # "run" or "redo-<n>": which pass logged it (old ledgers: "")

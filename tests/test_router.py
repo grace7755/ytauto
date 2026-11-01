@@ -237,11 +237,17 @@ def test_mixkit_keyword_ladder_goes_specific_to_broad():
     from ytauto.sources.stock import Mixkit
     l = Mixkit.keyword_ladder("Mount Fuji snow-capped volcano above a calm lake")
     assert l[0] == "Mount Fuji snow-capped volcano above a calm lake", "the real query comes first"
-    assert "mountain" in l and "water" in l, "broad terms follow"
-    assert l[-1] == "nature", "always end on a category that has clips"
-    # no duplicates, and a single word still yields a usable ladder
-    assert len(l) == len(set(x.lower() for x in l))
-    assert Mixkit.keyword_ladder("tokyo") == ["tokyo", "nature"]
+    assert "mountain" in l and "water" in l, "broad terms the words imply follow"
+    assert len(l) == len(set(x.lower() for x in l)), "no duplicates"
+    assert Mixkit.keyword_ladder("tokyo") == ["tokyo"]
+
+
+def test_mixkit_never_falls_back_to_an_unrelated_category():
+    """Russian-firearms film: the old unconditional "nature" step returned the same waterfall for 55 gun shots."""
+    from ytauto.sources.stock import Mixkit
+    for q in ("Russian sniper rifle bolt action", "pistol accessory rail", "PPK-20 blowback action"):
+        assert "nature" not in [t.lower() for t in Mixkit.keyword_ladder(q)]
+    assert "sea" in Mixkit.keyword_ladder("open sea waves at sunset"), "a shot that names nature still gets it"
 
 
 @pytest.mark.parametrize("code,expect_blocked,expect_terms", [
@@ -302,3 +308,19 @@ def test_zai_link_has_a_raised_token_budget():
     assert zai, "the chain should still contain the zai link"
     for link in zai:
         assert link.max_tokens >= 8192, f"{link.model} needs room to reason before answering"
+
+
+def test_link_stats_count_who_answered(monkeypatch, tmp_path):
+    """video-4's log could not say which link answered a call; logs/judge-links*.json now does."""
+    from ytauto.cache import Cache
+    from ytauto.llm import router as R
+    from ytauto.llm.providers import ProviderConfig
+    monkeypatch.setattr(ProviderConfig, "load", classmethod(lambda cls, p=None: cls(
+        {"g": {"baseUrl": "https://example.invalid/g", "apiKey": "k"}})))
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    j = R.Judge(Settings(judge_chain=[JudgeLink(provider="g", model="m1", vision=True)], cache_dir=tmp_path,
+                         judge_patience=0), Cache(tmp_path))
+    monkeypatch.setattr(j, "_post", lambda *a, **k: '{"ok": true}')
+    for _ in range(2):
+        j.json("p", {"type": "object", "properties": {"ok": {"type": "boolean"}}})
+    assert j.link_stats()["answers"] == {"g/m1": 2}

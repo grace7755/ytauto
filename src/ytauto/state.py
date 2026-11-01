@@ -54,8 +54,11 @@ class Project:
         atomic_write(self.state_file, json.dumps(self.state, indent=2, default=str))
 
     # ---- ledger -------------------------------------------------------
+    run_label = ""                     # set by the pipeline ("run" / "redo-<n>"), stamped on every row
+
     def log_decision(self, d: Decision):
         d.ts = d.ts or time.strftime("%Y-%m-%dT%H:%M:%S")
+        d.run = d.run or self.run_label
         with _LEDGER_LOCK, self.ledger_file.open("a", encoding="utf-8") as f:   # shots run in parallel
             f.write(d.model_dump_json() + "\n")
 

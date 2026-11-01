@@ -109,6 +109,9 @@ def test_gone_errors_are_told_apart_from_bot_checks():
     assert Y.is_gone("Private video. Sign in if you've been granted access")
     assert not Y.is_gone("Sign in to confirm you're not a bot. This video is not available")
     assert not Y.is_gone("HTTP Error 503")
+    # age-restricted is permanent without cookies (video-4: one ID looked up 62 times); the bot check stays transient
+    assert Y.is_gone("ERROR: [youtube] 5_LvFpIu8FI: Sign in to confirm your age. This video may be inappropriate for some users.")
+    assert not Y.is_gone("ERROR: [youtube] x: Sign in to confirm you’re not a bot")
 
 
 def test_a_gone_video_is_remembered_and_never_asked_again(tmp_path, monkeypatch):
