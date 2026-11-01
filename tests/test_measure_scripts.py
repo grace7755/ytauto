@@ -82,3 +82,15 @@ def test_photo_coverage_uses_the_photo_steps_queries_and_counts_covered_shots():
     r = m.summarise(hits, {1: "photo", 2: "photo", 3: "footage"})
     assert r["all"]["any"] == (2, 3) and r["all"]["commons"] == (1, 3)
     assert r["photo"]["any"] == (1, 2) and r["footage"]["pexels"] == (1, 1)
+
+
+def test_photo_coverage_counts_a_hit_as_exact_only_when_it_names_the_subjects_model():
+    m = _load("measure_photo_coverage")
+    ak = {"subject": "AK-12 assault rifle", "entities": ["Kalashnikov"]}
+    assert m.distinctive(ak) == {"ak-12", "kalashnikov"}, "category words (rifle, assault) identify nothing"
+    assert m.is_exact("Soldier with an AK-12 in a field", ak)
+    assert m.is_exact("kalashnikov concern factory", ak)
+    assert not m.is_exact("man holding rifle on range, russian soldier", ak), "a generic gun photo is not the AK-12"
+    assert m.is_exact("AK12 rifle", {"subject": "AK-12"}) is False, "a different spelling is a miss, not a guess"
+    assert not m.is_exact("", ak) and not m.is_exact("anything", {"subject": "rifle"}), "no distinctive word, nothing to match"
+    assert m.is_exact("Lobaev SVL on a bench", {"subject": "Lobaev SVL rifle"})

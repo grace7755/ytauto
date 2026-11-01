@@ -70,6 +70,9 @@ still_min_relevance: 75  # stricter than clips (min_relevance 60): a photo must 
 still_order: [pexels, pixabay, commons]
 still_min_width: 2000
 still_tries: 3
+photo_first_providers: [commons]  # photo-first shots (named products) search only these first: Pexels/Pixabay give generic photos the judge rejects
+commons_gap: 1.0            # seconds between Wikimedia Commons requests (429 otherwise); a 429 pauses Commons for its Retry-After
+contact: ""                 # an email or URL for the User-Agent Wikimedia asks for (optional, e.g. you@example.com)
 watermark_crop: true     # a corner-logo-only clip (source tall enough) is re-cut 1.15x closer, then judged again
 watermark_crop_zoom: 1.15
 

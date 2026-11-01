@@ -244,6 +244,11 @@ class Settings(BaseModel):
     still_min_relevance: float = 75.0   # stricter than clips: keyword-level matches are not enough
     still_min_width: int = 2000        # px; a 12% push-in on a smaller picture goes soft
     still_tries: int = 3               # pictures judged per shot, across all providers
+    # photo-first shots (visual_kind "photo": a named product) search only these providers first: Pexels/Pixabay return generic
+    # photos for any query, which the judge rejects at relevance < still_min_relevance, so they would use up still_tries
+    photo_first_providers: list[str] = Field(default_factory=lambda: ["commons"])
+    commons_gap: float = 1.0           # seconds between Wikimedia Commons requests (it answers 429 to a fast client)
+    contact: str = ""                  # e.g. an email or URL: put in the User-Agent Wikimedia asks every client to send
     still_share_warn: float = 10.0
     # qa
     qa_max_loops: int = 2

@@ -182,19 +182,19 @@ class LastResort:
         return None
 
     # -- still pictures ---------------------------------------------------------------------------------
-    def _still(self, shot: Shot) -> Decision | None:
+    def _still(self, shot: Shot, only: list[str] | None = None) -> Decision | None:
         """A licensed photograph with a slow move when no video (YouTube, stock) fits the shot.
         Judged exactly like a clip: relevance, watermark/text, and the dedicated AI question."""
         if not self.s.stills or not self.gem or shot.brief is None:
             return None
         if self._photos is None:
-            self._photos = make_photo_providers(self.s)
+            self._photos = make_photo_providers(self.s, self.cache)
         b = shot.brief
         # the place goes into the first query: "reef" alone finds any reef, the brief wants this one
         queries = list(dict.fromkeys(q.strip() for q in [f"{b.subject} {b.setting}", b.subject, *(b.stock_queries or [])] if q.strip()))[:3]
         left = self.s.still_tries
         for name, prov in self._photos.items():
-            if not prov.available():
+            if not prov.available() or (only is not None and name not in only):
                 continue
             for q in queries:
                 for c in prov.search(q, 4):

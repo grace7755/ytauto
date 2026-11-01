@@ -158,7 +158,7 @@ def test_a_found_photo_ends_the_ladder(tmp_path):
     order = []
     _record(sel, order, *ALL_STEPS)
     photo = Decision(shot=0, status="accepted", provider="still_commons", source_id="1", url="u")
-    sel._still = lambda shot: order.append("_still") or photo
+    sel._still = lambda shot, only=None: order.append("_still") or photo
     assert sel.select(sh) is photo and order == ["_still"]
 
 
@@ -301,3 +301,129 @@ def test_the_review_is_told_a_category_shot_shows_its_category(tmp_path):
     proj.log_decision(Decision(shot=3, status="accepted", provider="youtube", source_id="v", url="u", clip_path=str(clip),
                                notes="w | CATEGORY FALLBACK: submachine gun (for PPK-20 submachine gun)"))
     assert "a clear shot of submachine gun counts" in _category_note(proj, sh)
+
+
+# --- photo-first searches Commons only; Commons is polite ---------------------------------------------
+def test_photo_first_asks_only_the_configured_photo_providers(tmp_path):
+    sh = _shot(0, visual_kind="photo")
+    sel, _ = _sel(tmp_path, [sh])
+    order, seen = [], []
+    _record(sel, order, *ALL_STEPS)
+    sel._still = lambda shot, only=None: seen.append(only)
+    sel.select(sh)
+    assert seen == [["commons"]], "Pexels/Pixabay photos of a named product are generic and would use up the tries"
+    sel2, _ = _sel(tmp_path / "two", [_shot(1)])
+    seen.clear()
+    _record(sel2, [], *ALL_STEPS)
+    sel2._still = lambda shot, only=None: seen.append(only)
+    sel2.select(sel2.shots[0])
+    assert seen == [None], "a normal shot's later photo step still tries every provider"
+
+
+def test_the_photo_step_skips_providers_outside_the_filter(tmp_path):
+    sh = _shot(0)
+    sel, _ = _sel(tmp_path, [sh], gem=object())
+
+    class P:
+        def __init__(self, name):
+            self.name, self.asked = name, 0
+
+        def available(self):
+            return True
+
+        def search(self, q, n):
+            self.asked += 1
+            return []
+
+    sel._photos = {"pexels": P("pexels"), "commons": P("commons")}
+    sel._still(sh, only=["commons"])
+    assert sel._photos["pexels"].asked == 0 and sel._photos["commons"].asked > 0
+    sel._still(sh)
+    assert sel._photos["pexels"].asked > 0
+
+
+class _Resp:
+    def __init__(self, status=200, headers=None, pages=()):
+        self.status_code, self.headers, self._pages = status, headers or {}, list(pages)
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(f"{self.status_code} error")
+
+    def json(self):
+        return {"query": {"pages": self._pages}}
+
+
+def _page(i):
+    return {"pageid": i, "index": i, "title": f"File:p{i}.jpg", "imageinfo": [{
+        "mime": "image/jpeg", "width": 3000, "height": 2000, "url": f"u{i}", "descriptionurl": f"d{i}",
+        "extmetadata": {"LicenseShortName": {"value": "CC0"}}}]}
+
+
+@pytest.fixture
+def commons(monkeypatch, tmp_path):
+    """A Commons whose network and clock are fake; shared throttle state reset per test."""
+    from ytauto.sources import images as IMG
+    now = [1000.0]
+    calls, sleeps = [], []
+    monkeypatch.setattr(IMG.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(IMG.time, "sleep", lambda s: (sleeps.append(s), now.__setitem__(0, now[0] + s)))
+    monkeypatch.setattr(IMG.Commons, "_last", 0.0)
+    monkeypatch.setattr(IMG.Commons, "_blocked_until", 0.0)
+    responses = []
+
+    def get(url, **kw):
+        calls.append(kw)
+        return responses.pop(0) if responses else _Resp(pages=[_page(1)])
+    monkeypatch.setattr(IMG.requests, "get", get)
+    c = IMG.Commons(Settings(commons_gap=1.0, contact="me@example.com"), Cache(tmp_path / "c"))
+    return c, calls, sleeps, responses, now
+
+
+def test_commons_calls_are_spaced_by_the_gap(commons):
+    c, calls, sleeps, _, now = commons
+    c.search("a", 4)
+    c.search("b", 4)
+    assert len(calls) == 2 and sleeps and abs(sleeps[0] - 1.0) < 1e-6, "the second call waited the gap"
+
+
+def test_commons_sends_a_descriptive_user_agent(commons):
+    c, calls, *_ = commons
+    c.search("a", 4)
+    assert "me@example.com" in calls[0]["headers"]["User-Agent"]
+
+
+def test_a_429_pauses_commons_for_retry_after_and_is_not_cached(commons):
+    c, calls, sleeps, responses, now = commons
+    responses.append(_Resp(429, {"Retry-After": "30"}))
+    assert c.search("a", 4) == []
+    assert c.search("b", 4) == [] and len(calls) == 1, "paused: no second request"
+    now[0] += 31
+    got = c.search("a", 4)
+    assert len(calls) == 2 and [x.source_id for x in got] == ["1"], "after the pause it asks again; the 429 was not cached"
+
+
+def test_a_429_without_retry_after_pauses_for_a_minute(commons):
+    c, calls, _, responses, now = commons
+    responses.append(_Resp(429))
+    c.search("a", 4)
+    now[0] += 59
+    assert c.search("b", 4) == [] and len(calls) == 1
+    now[0] += 2
+    c.search("b", 4)
+    assert len(calls) == 2
+
+
+def test_an_answered_query_is_cached_and_makes_no_second_request(commons):
+    c, calls, *_ = commons
+    first = c.search("ak-12", 4)
+    again = c.search("ak-12", 4)
+    assert len(calls) == 1 and [x.source_id for x in first] == [x.source_id for x in again] == ["1"]
+    assert again[0].provider == "still_commons"
+
+
+def test_a_failed_request_is_not_cached(commons):
+    c, calls, _, responses, _ = commons
+    responses.append(_Resp(500))
+    assert c.search("a", 4) == []
+    assert [x.source_id for x in c.search("a", 4)] == ["1"] and len(calls) == 2

@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import html
 import re
+import threading
+import time
 from pathlib import Path
 
 import requests
@@ -26,8 +28,9 @@ _COMMONS_OK = re.compile(r"^(public domain|pd\b|cc0|cc[ -]by(?:[ -]sa)?\b|attrib
 class PhotoProvider:
     name = ""
 
-    def __init__(self, s: Settings):
+    def __init__(self, s: Settings, cache=None):
         self.s = s
+        self.cache = cache                 # optional disk cache for search answers (Commons uses it)
 
     def available(self) -> bool:
         return True
@@ -100,21 +103,60 @@ class PixabayPhotos(PhotoProvider):
 
 
 class Commons(PhotoProvider):
-    """Wikimedia Commons: free, and the API reports licence, author and restrictions per file."""
+    """Wikimedia Commons: free, and the API reports licence, author and restrictions per file.
+
+    Polite by construction: Commons answers HTTP 429 to a fast, anonymous client (video-4's coverage run was refused from
+    shot ~39 on). All instances share one lock and clock: calls are `commons_gap` seconds apart, a 429 pauses Commons for the
+    time its `Retry-After` names (60 s if absent) and is logged once, and answers are cached on disk so a redo or re-run does
+    not ask again. Errors are never cached."""
     name = "commons"
+    _lock = threading.Lock()
+    _last = 0.0                    # monotonic time of the last request
+    _blocked_until = 0.0           # monotonic time before which Commons is not asked
+
+    def _headers(self) -> dict:
+        c = (getattr(self.s, "contact", "") or "").strip()
+        return {"User-Agent": f"ytauto/0.1 ({c})" if c else UA["User-Agent"]}
 
     def search(self, query, n=6):
+        hit = self.cache.get("commons-v1", query, n) if self.cache else None
+        if hit is not None:
+            return [Candidate(**d) for d in hit]
+        with Commons._lock:                           # one request at a time, spaced out
+            now = time.monotonic()
+            if now < Commons._blocked_until:
+                return []
+            wait = Commons._last + self.s.commons_gap - now
+            if wait > 0:
+                time.sleep(wait)
+            Commons._last = time.monotonic()
+            out = self._request(query, n)
+        if out is not None and self.cache:
+            self.cache.set("commons-v1", [c.model_dump() for c in out], query, n)
+        return out or []
+
+    def _request(self, query, n) -> list[Candidate] | None:
+        """The candidates, or None when the request failed (not cached, so it is asked again later)."""
         try:
-            r = requests.get("https://commons.wikimedia.org/w/api.php", timeout=30, headers=UA, params={
+            r = requests.get("https://commons.wikimedia.org/w/api.php", timeout=30, headers=self._headers(), params={
                 "action": "query", "generator": "search", "gsrsearch": f"{query} filetype:bitmap",
                 "gsrnamespace": 6, "gsrlimit": n * 3, "prop": "imageinfo",
                 "iiprop": "url|size|mime|extmetadata", "iiurlwidth": 3840,
                 "iiextmetadatafilter": "LicenseShortName|Artist|NonFree|Restrictions", "format": "json",
                 "formatversion": 2})
+            if getattr(r, "status_code", 200) == 429:
+                try:
+                    secs = float(r.headers.get("Retry-After", 60))
+                except (TypeError, ValueError):
+                    secs = 60.0
+                secs = min(max(secs, 1.0), 600.0)
+                Commons._blocked_until = time.monotonic() + secs
+                log.warning("commons rate-limited (429): not asking again for %.0f s", secs)
+                return None
             r.raise_for_status()
         except Exception as e:
             log.warning("commons search failed: %s", str(e)[:160])
-            return []
+            return None
         out = []
         for p in sorted(r.json().get("query", {}).get("pages", []), key=lambda p: p.get("index", 99)):
             info = (p.get("imageinfo") or [{}])[0]
@@ -132,6 +174,6 @@ class Commons(PhotoProvider):
         return out[:n]
 
 
-def make_photo_providers(s: Settings) -> dict[str, PhotoProvider]:
-    all_ = {"pexels": PexelsPhotos(s), "pixabay": PixabayPhotos(s), "commons": Commons(s)}
+def make_photo_providers(s: Settings, cache=None) -> dict[str, PhotoProvider]:
+    all_ = {"pexels": PexelsPhotos(s, cache), "pixabay": PixabayPhotos(s, cache), "commons": Commons(s, cache)}
     return {k: all_[k] for k in s.still_order if k in all_}

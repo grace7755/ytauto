@@ -872,7 +872,8 @@ class Selector(LastResort):
         if not d:
             if photo_first:
                 # a named product rarely exists as clean footage: its photo first, then one quick YouTube round, then stock
-                d = self._still(shot) or self._youtube(shot, best, rounds=1) or self._stock(shot, best)
+                d = (self._still(shot, only=self.s.photo_first_providers) or self._youtube(shot, best, rounds=1)
+                     or self._stock(shot, best))
             elif shot.brief is not None and shot.brief.generic and self.s.stock_first:
                 d = self._stock(shot, best) or self._youtube(shot, best)
             else:
