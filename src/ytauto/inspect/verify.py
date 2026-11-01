@@ -89,7 +89,7 @@ def verify_clip(gem: Judge, clip: Path, shot: Shot, cache_id: str,
                            entities=b.names())
     try:
         v = gem.json_video_file(clip, prompt, VERIFY_SCHEMA, fps=2.0,
-                                cache_key=("verify-v2", cache_id, b.subject, b.visual, b.key()))
+                                cache_key=("verify-v2", cache_id, b.subject, b.visual, b.key()), task="verify")
     except JudgeError as e:
         if "frame grid" in str(e):          # this clip's problem, not an outage
             log.warning("verify failed for %s: %s", clip.name, str(e)[:200])
@@ -147,7 +147,7 @@ def verify_still(gem: Judge, image: Path, shot: Shot, cache_id: str, min_relevan
     prompt = STILL_PROMPT.format(text=shot.text, subject=b.subject or b.visual, visual=b.visual, entities=b.names())
     prompt += ("\n\n" + context if context else "") + STILL_RELEVANCE_RULE
     try:
-        v = gem.json_images(prompt, [jpeg], VERIFY_SCHEMA, cache_key=("verify-still-v2", cache_id, b.subject, b.visual, b.key(), context))
+        v = gem.json_images(prompt, [jpeg], VERIFY_SCHEMA, cache_key=("verify-still-v2", cache_id, b.subject, b.visual, b.key(), context), task="verify")
     except JudgeError:
         raise
     except Exception as e:
@@ -155,7 +155,7 @@ def verify_still(gem: Judge, image: Path, shot: Shot, cache_id: str, min_relevan
         return None
     if not needs_ai_check(v, min_relevance):
         return v
-    ai = gem.json_images(STILL_AI_PROMPT, [jpeg], STILL_AI_SCHEMA, cache_key=("aicheck-still", cache_id))
+    ai = gem.json_images(STILL_AI_PROMPT, [jpeg], STILL_AI_SCHEMA, cache_key=("aicheck-still", cache_id), task="aicheck")
     if isinstance(ai, dict) and "ai_generated" in ai:
         v["ai_or_animated"] = bool(ai["ai_generated"])
         v["notes"] = (v.get("notes") or "") + f" [dedicated AI check: {bool(ai['ai_generated'])}]"

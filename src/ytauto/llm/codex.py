@@ -82,7 +82,7 @@ class CodexClient:
     def installed(self) -> bool:
         return self.cmd is not None
 
-    def ask(self, model: str, content: list[dict], timeout: float | None = None) -> str:
+    def ask(self, model: str, content: list[dict], timeout: float | None = None, effort: str | None = None) -> str:
         if not self.cmd:
             raise CodexError("Codex (codex) is not installed")
         prompt, images = split_parts(content)
@@ -92,6 +92,8 @@ class CodexClient:
             args = self.cmd + ["exec", "-m", model, "-s", "read-only", "-C", str(tmpdir),
                                "--skip-git-repo-check", "--ephemeral", "--ignore-user-config",
                                "-o", str(out)]
+            if effort:
+                args += ["-c", f'model_reasoning_effort="{effort}"']
             for i, (data, ext) in enumerate(images):
                 p = tmpdir / f"img{i}{ext}"
                 p.write_bytes(data)

@@ -152,7 +152,7 @@ interface (`json`, `json_youtube`, `json_video_file`), so call sites do not know
 answered. Links come from `judge_chain` in `config/default.yaml`; `provider` is a key in the
 provider config at `$HEART_CONFIG`, or `_direct` for native google-genai + `GEMINI_API_KEY`.
 - `$HEART_CONFIG` belongs to **another project**. Read it, never write or copy it.
-- `_direct` links (the user's own free-tier key, straight to Google) come first. Free quota is per
+- The chain starts with ChatGPT through HeartCode (`_heart`): GPT Luna for every task, GPT Terra when Luna cannot give a valid answer, then the Gemini links (see Round 6; GPT Sol is refused by `JudgeLink`). `_direct` links (the user's own free-tier key, straight to Google) are the Gemini backup. Free quota is per
   project **per model**, so each Gemini model is its own link, and `Gemini(fallback=False)` calls
   exactly `link.model` - its old internal model-hopping spent quotas the chain was not counting.
   A daily-quota 429 ("requests per day") trips a link until midnight Pacific; a per-minute 429
@@ -242,6 +242,11 @@ Plan (A: stop wasted searching, B: footage -> photo -> category -> graphic ladde
 - `youtube.is_gone` treats "Sign in to confirm your age" as permanent (cached in `yt_gone`); the bot check ("not a bot") stays transient. One ID was looked up 62 times.
 - `Decision.run` ("run" / "redo-<n>") on every ledger row; `logs/timings-redo-<n>.json` and `logs/judge-links*.json` (answers per judge link) per pass.
 - Film-wide stock skip (`Selector._skip_irrelevant`, `stock_skip_after: 2`, `stock_skip_relevance: 25`, in `_stock` and `_still`): a stock/still item judged irrelevant on 2+ OTHER shots is not tried again unless its title shares a word with the shot's subject. Replayed on video-4's first pass: 206 of 827 stock/still attempts skipped, 0 accepted clips lost. Note the measured per-shot attempt counts: median 6, max 22 (judged attempts, screen-only rejects excluded), so a per-shot attempt cap is a weak lever (cap 16 saves 3%); the budget belongs in the ladder (footage -> photo -> category -> graphic).
+- **ChatGPT first** (`config/default.yaml`): `chatgpt gpt-6-luna` -> `chatgpt gpt-6.1-terra` -> Gemini, `judge_lanes: 1` (every call starts on Luna; Terra is a fallback, not a lane), `heart_concurrency: 4`. Probed live 2026-11-01: `gpt-6-terra` is rejected on a ChatGPT account, `gpt-6.1-terra` answers. `JudgeLink` refuses any model named Sol.
+- **Plan-wide usage limit** (`llm/limits.py`, `Judge._trip_plan`): Luna, Terra and Codex share ONE ChatGPT plan limit. A reply like "usage limit reached ... try again at 7:06 PM" pauses every ChatGPT link until that time (remembered across restarts) and the chain continues on Gemini; a hedge never goes to a second ChatGPT model. Before: each link was skipped for 5 min on its own (13 times in video-4).
+- **Reasoning effort per task** (`judge_effort: {task: low|medium|high}`, `JudgeLink.effort`): tasks are `plan, critic, screen, verify, aicheck, review, facts`. Heart gets `--effort`, Codex `-c model_reasoning_effort=`. Unset = each tool's default (nothing was ever set before). Set only from `scripts/measure_effort.py` (uses your plan).
+- `scripts/measure_clip_gate.py <project>`: offline CLIP check of stock/still files against the shot subject vs the AI's relevance; says whether a "reject below similarity t" gate before the AI would skip many verifications and lose none (video-4: 442 stock/still attempts were judged at relevance <= 20).
+- Image generation from a script works on the ChatGPT plan with no API key: `codex exec -m gpt-6.1-terra "<prompt>"` uses Codex's built-in `image_gen` tool, saves under `~/.codex/generated_images/<session>/` and copies where asked. It cost about 17k tokens for one image: ration it (illustrations only, a small per-film budget).
 - `scripts/measure_attempts.py <project> [--before ISO | --run run]`: yield per provider, stock items tried on many shots, what the film-wide stock skip and a per-shot attempt cap would save and lose. Thresholds for those fixes come from its output.
 
 ## Working in Claude Code (moved back from Nibedita, 31 Oct 2026)

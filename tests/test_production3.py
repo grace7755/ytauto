@@ -281,7 +281,7 @@ def test_review_batches_ten_shots_per_call_and_reports_each_rating(tmp_path):
     calls = []
 
     class Gem:
-        def json_images(self, prompt, images, schema, cache_key=None):
+        def json_images(self, prompt, images, schema, cache_key=None, **kw):
             ids = [int(x[1:].split("]")[0]) for x in prompt.splitlines() if x.startswith("[")]
             calls.append(ids)
             return {"shots": [{"id": i, "match": 20 if i == 3 else 90, "why": "wrong place" if i == 3 else ""} for i in ids]}

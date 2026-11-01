@@ -75,7 +75,8 @@ def review(gem: Judge, proj: Project, shots: list[Shot], per: int = 10) -> list[
         batch = items[i:i + per]
         lines = "\n".join(f"[{sh.id}] {sh.text}" for sh, _ in batch)
         res = gem.json_images(PROMPT.format(n=len(batch), lines=lines), [sheet([(sh.id, f) for sh, f in batch])],
-                              REVIEW_SCHEMA, cache_key=("review-v1", lines, tuple(proj.accepted(sh.id).clip_path for sh, _ in batch)))
+                              REVIEW_SCHEMA, cache_key=("review-v1", lines, tuple(proj.accepted(sh.id).clip_path for sh, _ in batch)),
+                              task="review")
         got = {r["id"]: r for r in res.get("shots", []) if isinstance(r.get("id"), int)}
         for sh, _ in batch:
             r = got.get(sh.id, {})

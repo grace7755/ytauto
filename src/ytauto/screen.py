@@ -74,7 +74,7 @@ def screen_url(gem: Judge, c: Candidate, shot: Shot, fps: float = 1.0) -> dict |
     end = min(c.duration, 1200) if c.duration > 1200 else None
     try:
         data = gem.json_youtube(c.url, prompt, SCREEN_SCHEMA, end=end, fps=fps,
-                                cache_key=("screen-v2", c.source_id, b.subject, b.visual, b.key()))
+                                cache_key=("screen-v2", c.source_id, b.subject, b.visual, b.key()), task="screen")
     except JudgeError:
         raise                     # chain exhausted: our outage, not this candidate's fault
     except Exception as e:
@@ -292,7 +292,7 @@ def screen_storyboards(gem: Judge, cands: list[Candidate], shot: Shot, sbs: list
                                  visual=b.visual, entities=b.names(), text=shot.text,
                                  avoid=", ".join(b.avoid) or "-")
     try:
-        data = gem.json_images(prompt, [sbs[i].jpeg for i in todo], BATCH_SCHEMA)
+        data = gem.json_images(prompt, [sbs[i].jpeg for i in todo], BATCH_SCHEMA, task="screen")
     except JudgeError:
         raise
     except Exception as e:
@@ -327,7 +327,7 @@ def screen_storyboard(gem: Judge, c: Candidate, shot: Shot, sb: Storyboard) -> d
                               entities=b.names(), text=shot.text,
                               avoid=", ".join(b.avoid) or "-")
     try:
-        data = gem.json_images(prompt, [sb.jpeg], SB_SCHEMA, cache_key=_sb_cache_key(c, shot))
+        data = gem.json_images(prompt, [sb.jpeg], SB_SCHEMA, cache_key=_sb_cache_key(c, shot), task="screen")
     except JudgeError:
         raise                     # chain exhausted: our outage, not this candidate's fault
     except Exception as e:

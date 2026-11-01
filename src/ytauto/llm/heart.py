@@ -99,13 +99,15 @@ class HeartClient:
     def installed(self) -> bool:
         return self.cmd is not None
 
-    def ask(self, model: str, content: list[dict], timeout: float | None = None) -> str:
+    def ask(self, model: str, content: list[dict], timeout: float | None = None, effort: str | None = None) -> str:
         if not self.cmd:
             raise HeartError("HeartCode (heart) is not installed")
         msg = json.dumps(to_message(content)) + "\n"
         args = self.cmd + ["-p", "--temp", "-m", model, "-C", str(self._cwd),
                            "--input-format", "stream-json", "--output-format", "json",
                            "--append-system-prompt", SYSTEM]
+        if effort:
+            args += ["--effort", effort]
         with self._slots:
             try:
                 r = subprocess.run(args, input=msg, capture_output=True, text=True, encoding="utf-8",

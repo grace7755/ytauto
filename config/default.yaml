@@ -41,7 +41,7 @@ screen_workers: 3       # candidates screened at the same time within one shot
 judge_concurrency: 4    # max AI-judge calls in flight at once (rate limits are the real ceiling)
 judge_hedge_after: 8    # a judge call slower than this (or 2.5x its link's usual time) is also sent to the next link; first answer wins. 0 = off
 download_ahead: true    # fetch the next screened candidate's section while the current clip is cut and judged
-heart_concurrency: 2    # ChatGPT (HeartCode) processes at once
+heart_concurrency: 4    # ChatGPT (HeartCode) processes at once; = judge_concurrency now that every call starts on Luna (was 2 when it was only an overflow lane)
 defer_ai_check: true    # skip the extra AI-footage call on a clip already rejected on score (checked later only if it becomes a weak match)
 judge_patience: 60      # seconds to wait for a judge link to recover before giving up a shot
 stock_tries_per_provider: 3
@@ -78,22 +78,23 @@ watermark_crop_zoom: 1.15
 #   Pacific (Gemini) or for an hour (others); a per-minute 429 only for its retry delay.
 #   Leave rpd unset unless you know the real cap. `ytauto quota` shows today's use.
 judge_chain:
-  # Primary: your own GEMINI_API_KEY (.env), straight to Google - no proxy in between. It is a
-  # free-tier key, and free quota is per project *per model*, so each model is its own link and
-  # the chain moves on when one model's day is spent. Probed live 2026-10-29; the 2.5 models
-  # answer 404 "no longer available to new users" on this key.
-  - {provider: _direct,      model: "gemini-3.1-flash-lite",           vision: true, youtube: true, rpm: 15}
-  # ChatGPT through Nibedita's HeartCode CLI (llm/heart.py): its own quota, no API key. Measured
-  # 2026-10-30 on 126 labelled clips: caught 58/64 watermark/text clips, flagged 3/62 clean ones
-  # (2 of those carry an "ON RIDE" watermark Gemini missed), 0 errors, median 6.5 s. Skipped
-  # automatically when `heart` is not installed; an expired login just trips the link.
+  # ChatGPT first, for every task (planner, critic, screening, clip and photo verification, the AI-made check, review, film
+  # facts): GPT Luna, then GPT Terra when Luna cannot give a valid answer (error, empty, cut off, broken JSON). Both go through
+  # Nibedita's HeartCode CLI (llm/heart.py) on your ChatGPT plan, no API key, and SHARE ONE usage limit: when the reply says
+  # "usage limit reached ... try again at 7:06 PM" both are paused until then (llm/limits.py) and the chain continues on Gemini.
+  # GPT Sol is excluded (config.py refuses it). Measured 2026-10-30 on 126 labelled clips with Luna: caught 58/64
+  # watermark/text clips, flagged 3/62 clean ones, 0 errors, median 6.5 s. Skipped automatically when `heart` is not installed.
   - {provider: _heart,       model: "chatgpt gpt-6-luna",              vision: true}
+  # Terra: probed live 2026-11-01 (`heart -p -m "chatgpt gpt-6.1-terra"` answered). `gpt-6-terra` is rejected on a ChatGPT account.
+  - {provider: _heart,       model: "chatgpt gpt-6.1-terra",          vision: true}
+  # Gemini: your own GEMINI_API_KEY (.env), straight to Google. Free quota is per project *per model*, so each model is its own
+  # link. Probed live 2026-10-29; the 2.5 models answer 404 "no longer available to new users" on this key.
+  - {provider: _direct,      model: "gemini-3.1-flash-lite",           vision: true, youtube: true, rpm: 15}
   - {provider: _direct,      model: "gemini-3.5-flash-lite",           vision: true, youtube: true, rpm: 15}
   - {provider: _direct,      model: "gemini-flash-lite-latest",        vision: true, youtube: true, rpm: 15}
-  # OPTIONAL, off by default: ChatGPT through OpenAI's Codex CLI (llm/codex.py), signed in with `codex login`
-  # (your ChatGPT plan, no API key). A plan has a message limit per few hours, so try it as an extra link
-  # first and check `ytauto quota` against ChatGPT Settings before relying on it. Uncomment to enable:
-  # - {provider: _codex,       model: "gpt-5",                          vision: true}
+  # OPTIONAL, off by default: ChatGPT through OpenAI's Codex CLI (llm/codex.py), signed in with `codex login`. It draws from the
+  # same ChatGPT plan limit as Luna and Terra, so it adds no capacity; only a second route if HeartCode breaks. Uncomment to enable:
+  # - {provider: _codex,       model: "gpt-6.1-terra",                  vision: true}
   # Fallback: providers from $HEART_CONFIG (another project's file; read, never written).
   - {provider: geminiopenai, model: "models/gemini-2.5-flash-lite",   vision: true, youtube: true, rpm: 15}
   - {provider: geminiopenai, model: "models/gemini-flash-lite-latest", vision: true, youtube: true, rpm: 15}
@@ -105,6 +106,11 @@ judge_chain:
   - {provider: zai,          model: "GLM-4.6V-Flash",                 vision: true, max_tokens: 8192}
   # Last: free tier allows only 20 requests/day on this model (from Google's own 429 message).
   - {provider: _direct,      model: "gemini-3-flash-preview",         vision: true, youtube: true, rpd: 20}
+# Calls always start at the top of the chain (Luna), then move down on failure. (2 = spread over the first two links.)
+judge_lanes: 1
+# Reasoning effort per task: low | medium | high. Empty = each tool's own default (Codex shows "medium"). Set from a measurement
+# (scripts/measure_effort.py), e.g.  judge_effort: {aicheck: low, screen: low, plan: medium, review: medium}
+judge_effort: {}
 # Frame grid sent to vision models in place of video (3x2 tile @1.2fps = 6 frames).
 grid_cols: 3
 grid_rows: 2

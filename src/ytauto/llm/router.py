@@ -25,9 +25,10 @@ from .. import timing
 from ..config import JudgeLink, Settings
 from ..inspect.grid import extract_grid_data_url, grid_hint
 from ..log import log
-from .codex import CODEX, CodexClient, CodexError, is_limit as codex_limit
+from .codex import CODEX, CodexClient, CodexError
 from .gemini import Gemini, GeminiError
 from .heart import HEART, HeartClient, HeartError
+from .limits import plan_limit_reset
 from .providers import DIRECT, ProviderConfig
 from .quota import Quota
 
@@ -44,6 +45,8 @@ _RETRY_AFTER = re.compile(r"\[retry-after (\d+(?:\.\d+)?)s\]")
 _PER_MINUTE = re.compile(r"per ?minute", re.I)
 _PER_DAY = re.compile(r"per ?day", re.I)
 _RETRY_DELAY = re.compile(r"retryDelay['\"]?\s*[:=]\s*['\"]?(\d+(?:\.\d+)?)s")
+# a plan-wide usage limit, as raised by the ChatGPT links: "PLAN LIMIT <epoch>: <message>" (see `_plan_limit`)
+_PLAN_LIMIT = re.compile(r"PLAN LIMIT (\d+(?:\.\d+)?)")
 _FENCE = re.compile(r"^\s*```(?:json)?\s*|\s*```\s*$", re.I)
 
 
@@ -267,7 +270,22 @@ class Judge:
         now = time.time()
         return {tag: round(until - now, 1) for tag, until in self._down.items() if until > now}
 
+    def _trip_plan(self, link: JudgeLink, until: float, why: str):
+        """The ChatGPT plan is out until `until`: pause EVERY link that draws from it (Luna, Terra, Codex), remembered
+        across restarts, so the chain goes straight to Gemini instead of asking the same spent plan again."""
+        group = self._group(link)
+        for l in self.chain:
+            if self._group(l) == group:
+                self.quota.exhaust_until(l, until)
+                self._quota_down[self._tag(l)] = until
+                self._down[self._tag(l)] = until
+        log.warning("ChatGPT plan usage limit reached; pausing %s until %s (%s)", group,
+                    time.strftime("%H:%M", time.localtime(until)), why[:120])
+
     def _trip(self, link: JudgeLink, why: str):
+        m = _PLAN_LIMIT.search(why)
+        if m:
+            return self._trip_plan(link, float(m.group(1)), why)
         # Measured 2026-10-29: once a free key's daily quota is spent, retrying it every 5 min for
         # the rest of the day only adds a failed round-trip to every call.
         quota = bool(_QUOTA.search(why)) and bool(_PER_DAY.search(why) or not _PER_MINUTE.search(why))
@@ -298,22 +316,34 @@ class Judge:
                 self._codex = CodexClient(self.s.codex_concurrency, self.s.codex_timeout)
             return self._codex
 
+    @staticmethod
+    def _group(link: JudgeLink) -> str:
+        """Links that share one usage limit: HeartCode and Codex both draw from the same ChatGPT plan."""
+        return "chatgpt" if link.provider in (HEART, CODEX) else f"{link.provider}/{link.model}"
+
+    def _plan_limit(self, e: Exception) -> JudgeError | None:
+        """A ChatGPT usage-limit message -> a JudgeError that `_trip` turns into a pause of every ChatGPT link."""
+        until = plan_limit_reset(str(e))
+        return None if until is None else JudgeError(f"PLAN LIMIT {until:.0f}: {str(e)[:200]}")
+
+    def _effort_for(self, link: JudgeLink, task: str) -> str | None:
+        e = link.effort or self.s.judge_effort.get(task or "")
+        return e.lower() if e else None
+
     def _post(self, link: JudgeLink, content: list[dict], schema: dict | None,
-              timeout: float = TIMEOUT) -> str:
+              timeout: float = TIMEOUT, effort: str | None = None) -> str:
         if link.provider == CODEX:          # ChatGPT plan through the Codex CLI (see llm/codex.py)
             try:
-                text = self._codex_client().ask(link.model, content, min(timeout, self.s.codex_timeout))
+                text = self._codex_client().ask(link.model, content, min(timeout, self.s.codex_timeout), effort=effort)
             except CodexError as e:
-                # a plan limit is a spent quota, not a failure: the run pauses instead of failing shots
-                raise JudgeError(f"HTTP 429: exceeded your current quota (ChatGPT plan limit): {str(e)[:200]}"
-                                 if codex_limit(str(e)) else str(e)) from e
+                raise (self._plan_limit(e) or JudgeError(str(e))) from e
             self.calls += 1
             return text
         if link.provider == HEART:          # ChatGPT through the HeartCode CLI (see llm/heart.py)
             try:
-                text = self._heart_client().ask(link.model, content, min(timeout, self.s.heart_timeout))
+                text = self._heart_client().ask(link.model, content, min(timeout, self.s.heart_timeout), effort=effort)
             except HeartError as e:
-                raise JudgeError(str(e)) from e
+                raise (self._plan_limit(e) or JudgeError(str(e))) from e
             self.calls += 1
             return text
         ep = self.cfg.endpoint(link.provider)
@@ -357,7 +387,8 @@ class Judge:
         return text
 
     def _send(self, link: JudgeLink, content: list[dict], schema: dict | None,
-              timeout: float = TIMEOUT, max_wait: float | None = None, busy: list | None = None) -> str | None:
+              timeout: float = TIMEOUT, max_wait: float | None = None, busy: list | None = None,
+              effort: str | None = None) -> str | None:
         """`_post` behind the daily counter, the per-minute bucket and the in-flight cap.
         None means nothing was sent: the link's daily cap is reached, or its minute bucket would
         wait longer than `max_wait` (then the link is added to `busy`)."""
@@ -367,6 +398,8 @@ class Judge:
         if not ok:
             return None
         with self._slots:
+            if effort:                           # only when set, so a custom `_post` without the argument still works
+                return self._post(link, content, schema, timeout, effort=effort)
             return self._post(link, content, schema, timeout)
 
     def _direct_client(self) -> Gemini:
@@ -378,7 +411,7 @@ class Judge:
     # -- core dispatch -------------------------------------------------------
     def _run(self, content_for: callable, schema: dict | None, *, need_vision: bool = False,
              need_youtube: bool = False, direct: callable | None = None,
-             timeout: float = TIMEOUT) -> dict:
+             timeout: float = TIMEOUT, task: str = "") -> dict:
         """Walk the chain until a link returns parseable JSON. `content_for(link)` builds the parts.
 
         If every link fails, wait `judge_patience` seconds once and walk the chain again before
@@ -420,7 +453,8 @@ class Judge:
                 self.calls += 1
                 return data
             t0 = time.time()
-            reply = self._send(link, content_for(link), schema, timeout, mode["max_wait"], mode["busy"])
+            reply = self._send(link, content_for(link), schema, timeout, mode["max_wait"], mode["busy"],
+                               self._effort_for(link, task))
             if reply is None:
                 return None                            # daily cap / minute bucket busy: not a failure
             self._note_latency(link, time.time() - t0)
@@ -538,6 +572,8 @@ class Judge:
         errors = (JudgeError, GeminiError, ValueError, json.JSONDecodeError)
         if hedge <= 0 or len(links) < 2:
             for link in links:
+                if self.quota.out_until(link):           # paused by an earlier failure in this very walk
+                    continue
                 try:
                     data = try_link(link)
                 except errors as e:
@@ -556,6 +592,10 @@ class Judge:
         ex = ThreadPoolExecutor(max_workers=2, thread_name_prefix="judge-hedge")
 
         def launch():
+            while queue and self.quota.out_until(queue[0]):
+                queue.pop(0)                              # paused meanwhile (plan-wide limit)
+            if not queue:
+                return
             link = queue.pop(0)
             pending[ex.submit(try_link, link)] = link
 
@@ -569,9 +609,15 @@ class Judge:
                 if not done:                                  # slow: ask the next link too
                     hedged = True
                     self._fastest_first(queue)
-                    if self._has_free_slot():
+                    # Never hedge onto a link that shares the slow one's usage limit: a second ChatGPT model
+                    # would spend the same plan twice for one answer.
+                    other = next((l for l in queue if self._group(l) != self._group(first)
+                                  and not self.quota.out_until(l)), None)
+                    if other is not None and self._has_free_slot():
+                        queue.remove(other)
+                        queue.insert(0, other)
                         log.info("judge %s slow (>%.0fs); hedging with %s", self._tag(first),
-                                 self._hedge_delay(first), self._tag(queue[0]))
+                                 self._hedge_delay(first), self._tag(other))
                         launch()
                     continue
                 for f in done:
@@ -603,20 +649,21 @@ class Judge:
 
     # -- public API (mirrors Gemini) ----------------------------------------
     def json(self, prompt: str, schema: dict, *, model: str | None = None,
-             cache_key: tuple | None = None):
+             cache_key: tuple | None = None, task: str = ""):
         if cache_key is not None:
             hit = self.cache.get("judge", *cache_key)
             if hit is not None:
                 return hit
         full = prompt + _schema_hint(schema)
-        data = self._run(lambda l: [{"type": "text", "text": full}], schema,
+        data = self._run(lambda l: [{"type": "text", "text": full}], schema, task=task,
                          direct=lambda g, m: g.json(prompt, schema, model=m))
         if cache_key is not None:
             self.cache.set("judge", data, *cache_key)
         return data
 
     def json_youtube(self, url: str, prompt: str, schema: dict, *, start: float | None = None,
-                     end: float | None = None, fps: float = 1.0, cache_key: tuple | None = None):
+                     end: float | None = None, fps: float = 1.0, cache_key: tuple | None = None,
+                     task: str = ""):
         """Analyse a public YouTube URL without downloading it.
 
         Verified: the OpenAI-compatible Gemini proxy accepts a watch URL in `image_url`
@@ -632,7 +679,7 @@ class Judge:
             return [{"type": "text", "text": full},
                     {"type": "image_url", "image_url": {"url": url}}]
 
-        data = self._run(content, schema, need_vision=True, need_youtube=True,
+        data = self._run(content, schema, need_vision=True, need_youtube=True, task=task,
                          direct=lambda g, m: g.json_youtube(url, prompt, schema, start=start,
                                                             end=end, fps=fps, model=m))
         if cache_key is not None:
@@ -640,7 +687,7 @@ class Judge:
         return data
 
     def json_images(self, prompt: str, images: list[bytes], schema: dict, *,
-                    cache_key: tuple | None = None):
+                    cache_key: tuple | None = None, task: str = ""):
         """Judge one or more JPEGs (e.g. a storyboard contact sheet). Every vision link qualifies."""
         if cache_key is not None:
             hit = self.cache.get("judge", *cache_key)
@@ -653,14 +700,14 @@ class Judge:
             return [{"type": "text", "text": full}] + [
                 {"type": "image_url", "image_url": {"url": u}} for u in urls]
 
-        data = self._run(content, schema, need_vision=True, timeout=IMAGE_TIMEOUT,
+        data = self._run(content, schema, need_vision=True, timeout=IMAGE_TIMEOUT, task=task,
                          direct=lambda g, m: g.json_images(prompt, images, schema, model=m))
         if cache_key is not None:
             self.cache.set("judge", data, *cache_key)
         return data
 
     def json_video_file(self, path: Path, prompt: str, schema: dict, *, fps: float = 2.0,
-                        cache_key: tuple | None = None):
+                        cache_key: tuple | None = None, task: str = ""):
         """Judge a local clip. Sends a tiled frame grid, which every vision model accepts."""
         if cache_key is not None:
             hit = self.cache.get("judge", *cache_key)
@@ -684,7 +731,7 @@ class Judge:
             jpeg = base64.b64decode(data_url.split(",", 1)[1])
             return g.json_images(grid_hint(cols, rows) + "\n\n" + prompt, [jpeg], schema, model=m)
 
-        data = self._run(content, schema, need_vision=True, direct=direct_call)
+        data = self._run(content, schema, need_vision=True, direct=direct_call, task=task)
         if cache_key is not None:
             self.cache.set("judge", data, *cache_key)
         return data
@@ -725,6 +772,8 @@ class Judge:
         prompt = question + _schema_hint(self.AI_CHECK_SCHEMA)
 
         for link in self._live(need_vision=True):
+            if self.quota.out_until(link):              # paused a moment ago (e.g. the plan-wide limit)
+                continue
             try:
                 if link.provider == DIRECT:
                     if self._direct_failed or not self.quota.acquire(link):
@@ -737,7 +786,7 @@ class Judge:
                 else:
                     reply = self._send(link, [{"type": "text", "text": prompt},
                                               {"type": "image_url", "image_url": {"url": data_url}}],
-                                       self.AI_CHECK_SCHEMA, IMAGE_TIMEOUT)
+                                       self.AI_CHECK_SCHEMA, IMAGE_TIMEOUT, effort=self._effort_for(link, "aicheck"))
                     if reply is None:
                         continue
                     data = _extract_json(reply)

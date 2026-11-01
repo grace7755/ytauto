@@ -83,7 +83,7 @@ def test_no_judge_means_no_facts_and_a_judge_failure_is_not_fatal():
     assert F.extract_facts(Down(), SEGS, "T", 40.0) == {}
 
     class Up:
-        def json(self, prompt, schema, cache_key=None):
+        def json(self, prompt, schema, cache_key=None, **kw):
             assert "[2] (16-26s) In Palawan" in prompt
             return _raw()
     assert [p["name"] for p in F.extract_facts(Up(), SEGS, "Philippines", 40.0)["places"]] == ["PALAWAN", "IFUGAO"]

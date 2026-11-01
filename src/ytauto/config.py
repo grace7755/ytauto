@@ -2,12 +2,13 @@
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 from typing import Literal
 
 import yaml
 from dotenv import load_dotenv
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -37,6 +38,26 @@ class JudgeLink(BaseModel):
     # ourselves skips a spent link without calling it. See llm/quota.py.
     rpm: int | None = None
     rpd: int | None = None
+    # reasoning effort for this link: low | medium | high (None = the tool's own default). Passed to HeartCode
+    # (--effort) and Codex (model_reasoning_effort); other links ignore it. A per-task value in `judge_effort` is the
+    # fallback when the link sets none.
+    effort: str | None = None
+
+    @field_validator("model")
+    @classmethod
+    def _no_sol(cls, v: str) -> str:
+        """GPT Sol is excluded from this system (owner's decision, 1 Nov 2026): Luna by default, Terra when Luna
+        cannot answer, Gemini when the ChatGPT plan is at its limit."""
+        if re.search(r"(?<![a-z0-9])sol(?![a-z0-9])", v, re.I):
+            raise ValueError(f"model {v!r}: GPT Sol is excluded from this project (use Luna or Terra)")
+        return v
+
+    @field_validator("effort")
+    @classmethod
+    def _effort_level(cls, v: str | None) -> str | None:
+        if v is not None and v.lower() not in ("low", "medium", "high"):
+            raise ValueError("effort must be low, medium or high")
+        return v.lower() if v else v
 
 
 # Verified working 2026-10-29; order = fastest and most accurate first.
@@ -140,6 +161,9 @@ class Settings(BaseModel):
     # judge links at the head of the chain used side by side (least expected wait first) instead
     # of strictly in order; 1 = plain chain order
     judge_lanes: int = 2
+    # reasoning effort per task (plan, critic, screen, verify, aicheck, review, facts): low | medium | high.
+    # Empty = every tool's own default. Set from a measurement (scripts/measure_effort.py), not by guess.
+    judge_effort: dict[str, str] = Field(default_factory=dict)
     # local face check on the storyboard tiles the judge picked: a presenter-sized face only moves a tile /
     # video to the back of the queue (never rejects). Off until measured on your ledgers:
     # scripts/measure_face_tiles.py

@@ -86,6 +86,11 @@ class Quota:
         self.cache.set("quota_out", until, self.tag(link))
         return until
 
+    def exhaust_until(self, link: JudgeLink, until: float) -> float:
+        """The plan says when it is available again: remember that exact time (across restarts)."""
+        self.cache.set("quota_out", until, self.tag(link))
+        return until
+
     # -- per request -----------------------------------------------------------
     def acquire(self, link: JudgeLink, max_wait: float | None = None) -> bool | None:
         """Count one request against the link. False (and nothing counted) if the daily cap is

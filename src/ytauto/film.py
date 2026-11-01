@@ -91,7 +91,7 @@ def extract_facts(gem, segments: list[Segment], title: str, seconds: float) -> d
     prompt = FACTS_PROMPT.format(title=title, lines=lines, max_chapters=max(3, int(seconds // 35)),
                                  max_places=max(3, int(seconds // 40)))
     try:
-        raw = gem.json(prompt, FACTS_SCHEMA, cache_key=("film-facts-v1", title, lines))
+        raw = gem.json(prompt, FACTS_SCHEMA, cache_key=("film-facts-v1", title, lines), task="facts")
     except Exception as e:
         log.warning("film facts unavailable (%s); the film gets no stat cards, place chips or chapters", str(e)[:120])
         return {}

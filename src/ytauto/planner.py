@@ -342,7 +342,7 @@ def _critic(gem: Judge, batch: list[Shot], briefs: dict[int, Brief], topic: str,
         return 0
     try:
         data = gem.json(CRITIC_PROMPT.format(topic=topic or "-", shots="\n".join(lines)), CRITIC_SCHEMA,
-                        cache_key=("plan-critic-v1",) + cache_key)
+                        cache_key=("plan-critic-v1",) + cache_key, task="critic")
     except QuotaExhausted:
         raise
     except Exception as e:
@@ -426,7 +426,7 @@ def plan(segments: list[Segment], shots: list[Shot], title: str, s: Settings, ca
         ids = {sh.id for sh in batch}
         try:
             key = (title, payload, s.queries_per_segment)
-            data = gem.json(prompt, PLAN_SCHEMA, cache_key=("plan-shots-v4",) + key)
+            data = gem.json(prompt, PLAN_SCHEMA, cache_key=("plan-shots-v4",) + key, task="plan")
             topic = topic or str(data.get("topic") or "").strip()
             for d in data.get("shots") or []:
                 if isinstance(d.get("id"), int) and d["id"] in ids:
