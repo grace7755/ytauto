@@ -28,7 +28,7 @@ from ..log import log
 from .codex import CODEX, CodexClient, CodexError
 from .gemini import Gemini, GeminiError
 from .heart import HEART, HeartClient, HeartError
-from .limits import plan_limit_reset
+from .limits import DEFAULT_PAUSE, MAX_PAUSE, plan_limit
 from .providers import DIRECT, ProviderConfig
 from .quota import Quota
 
@@ -216,6 +216,7 @@ class Judge:
         self._inflight_lock = threading.Lock()
         self.calls = 0
         self.answers: dict[str, int] = {}            # answers per link (logs/judge-links.json)
+        self._limit_hits: dict[str, int] = {}        # consecutive usage-limit replies per plan group (back-off)
         self.tokens = 0
 
         self.chain: list[JudgeLink] = [l for l in settings.judge_chain if self._usable(l)]
@@ -321,10 +322,28 @@ class Judge:
         """Links that share one usage limit: HeartCode and Codex both draw from the same ChatGPT plan."""
         return "chatgpt" if link.provider in (HEART, CODEX) else f"{link.provider}/{link.model}"
 
-    def _plan_limit(self, e: Exception) -> JudgeError | None:
-        """A ChatGPT usage-limit message -> a JudgeError that `_trip` turns into a pause of every ChatGPT link."""
-        until = plan_limit_reset(str(e))
-        return None if until is None else JudgeError(f"PLAN LIMIT {until:.0f}: {str(e)[:200]}")
+    def _plan_limit(self, e: Exception, link: JudgeLink) -> JudgeError | None:
+        """A ChatGPT usage-limit message -> a JudgeError that `_trip` turns into a pause of every ChatGPT link.
+
+        A message that names the reset time is believed. One that does not (HeartCode's) pauses 15 min, then 30, then 60 while
+        the plan keeps saying no; the count resets after the first successful ChatGPT answer. Several in-flight calls failing
+        together are ONE event: while the group is already paused the pause is not lengthened again."""
+        res = plan_limit(str(e))
+        if res is None:
+            return None
+        until, named = res
+        group = self._group(link)
+        if not named:
+            held = self.quota.out_until(link)
+            with self._inflight_lock:
+                n = self._limit_hits.get(group, 0) + (0 if held else 1)
+                self._limit_hits[group] = max(n, 1)
+            until = held or time.time() + min(MAX_PAUSE, DEFAULT_PAUSE * 2 ** (max(n, 1) - 1))
+        return JudgeError(f"PLAN LIMIT {until:.0f}: {str(e)[:200]}")
+
+    def _chatgpt_ok(self, link: JudgeLink):
+        with self._inflight_lock:
+            self._limit_hits.pop(self._group(link), None)
 
     def _effort_for(self, link: JudgeLink, task: str) -> str | None:
         e = link.effort or self.s.judge_effort.get(task or "")
@@ -336,15 +355,17 @@ class Judge:
             try:
                 text = self._codex_client().ask(link.model, content, min(timeout, self.s.codex_timeout), effort=effort)
             except CodexError as e:
-                raise (self._plan_limit(e) or JudgeError(str(e))) from e
+                raise (self._plan_limit(e, link) or JudgeError(str(e))) from e
             self.calls += 1
+            self._chatgpt_ok(link)
             return text
         if link.provider == HEART:          # ChatGPT through the HeartCode CLI (see llm/heart.py)
             try:
                 text = self._heart_client().ask(link.model, content, min(timeout, self.s.heart_timeout), effort=effort)
             except HeartError as e:
-                raise (self._plan_limit(e) or JudgeError(str(e))) from e
+                raise (self._plan_limit(e, link) or JudgeError(str(e))) from e
             self.calls += 1
+            self._chatgpt_ok(link)
             return text
         ep = self.cfg.endpoint(link.provider)
         if ep is None:

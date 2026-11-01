@@ -236,3 +236,65 @@ def test_a_codex_usage_limit_pauses_the_whole_chatgpt_plan_too(monkeypatch, tmp_
     monkeypatch.setattr(j, "_post", lambda link, *a, **k: (real_post(j, link, *a, **k) if link.provider != "g" else '{"ok": true}'))
     assert j.json("p", SCHEMA) == {"ok": True}
     assert j._heart.asked == [], "Heart shares the Codex plan, so it is paused as well"
+
+
+# --- HeartCode's usage-limit message names no time: back off 15 -> 30 -> 60 minutes ---------------------------
+NO_TIME = "heart error: Usage limit reached. Review your plan or this app's limit in ChatGPT settings — https://chatgpt.com/settings/usage"
+
+
+def _until(err):
+    import re
+    return float(re.search(r"PLAN LIMIT (\d+)", str(err)).group(1))
+
+
+def test_plan_limit_without_a_time_is_recognised_but_not_named():
+    assert L.plan_limit(NO_TIME, _at(12)) == (_at(12) + L.DEFAULT_PAUSE, False)
+    assert L.plan_limit("You've hit your usage limit. Try again at 7:06 PM.", _at(18, 43)) == (_at(19, 6), True)
+    assert L.plan_limit("HTTP 503 high demand", _at(12)) is None
+
+
+def test_the_pause_grows_while_the_plan_keeps_saying_no_and_resets_after_a_success(monkeypatch, tmp_path):
+    import time as _t
+    j = _judge(monkeypatch, tmp_path, _chain(), FakeHeart())
+    luna = _chain()[0]
+    now = _t.time()
+    waits = []
+    for _ in range(5):
+        e = j._plan_limit(HeartError(NO_TIME), luna)
+        waits.append(round((_until(e) - _t.time()) / 60))
+        j.quota.cache.set("quota_out", 0, j.quota.tag(luna))          # the pause has expired
+    assert waits == [15, 30, 60, 60, 60], "15, 30, then 60 minutes and no longer"
+    j._chatgpt_ok(luna)
+    e = j._plan_limit(HeartError(NO_TIME), luna)
+    assert round((_until(e) - _t.time()) / 60) == 15, "one good answer starts the back-off again"
+
+
+def test_calls_failing_together_are_one_event_and_do_not_lengthen_the_pause(monkeypatch, tmp_path):
+    j = _judge(monkeypatch, tmp_path, _chain(), FakeHeart())
+    luna, terra = _chain()[0], _chain()[1]
+    first = j._plan_limit(HeartError(NO_TIME), luna)
+    j._trip(luna, str(first))                                       # the pause is now in force for the whole plan
+    second = j._plan_limit(HeartError(NO_TIME), terra)              # an in-flight call fails a moment later
+    assert _until(second) == _until(first)
+    third = j._plan_limit(HeartError(NO_TIME), luna)
+    assert _until(third) == _until(first)
+
+
+def test_a_named_time_is_used_as_is_and_does_not_start_the_back_off(monkeypatch, tmp_path):
+    j = _judge(monkeypatch, tmp_path, _chain(), FakeHeart())
+    e = j._plan_limit(HeartError("usage limit reached, try again in 2 hours"), _chain()[0])
+    import time as _t
+    assert abs((_until(e) - _t.time()) - 7200) < 5
+    assert j._limit_hits == {}
+
+
+def test_a_real_run_pauses_every_chatgpt_link_for_the_backoff_time(monkeypatch, tmp_path):
+    import time as _t
+    heart = FakeHeart(NO_TIME.replace("heart error: ", ""))
+    j = _judge(monkeypatch, tmp_path, _chain(), heart)
+    real_post = R.Judge._post
+    monkeypatch.setattr(j, "_post", lambda link, *a, **k: (real_post(j, link, *a, **k) if link.provider == "_heart" else '{"ok": true}'))
+    assert j.json("p", SCHEMA) == {"ok": True}
+    for l in _chain()[:2]:
+        assert 14 * 60 < j.quota.out_until(l) - _t.time() <= 15 * 60 + 5
+    assert [m for m, _ in heart.asked] == [LUNA]

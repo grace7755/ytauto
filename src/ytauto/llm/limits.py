@@ -17,8 +17,21 @@ _AT = re.compile(r"(?:try again|resets?|available again|come back)\s+(?:at|on)?\
 _IN = re.compile(r"(?:in|after)\s+(\d+(?:\.\d+)?)\s*(second|sec|minute|min|hour|hr|day)s?\b", re.I)
 _UNIT = {"second": 1, "sec": 1, "minute": 60, "min": 60, "hour": 3600, "hr": 3600, "day": 86400}
 
-DEFAULT_PAUSE = 900.0         # no time in the message: look again in 15 min (Gemini carries the run meanwhile)
+DEFAULT_PAUSE = 900.0         # no time in the message: look again in 15 min (Gemini carries the run meanwhile) ...
+MAX_PAUSE = 3600.0            # ... then 30, then 60 min while the plan keeps saying no
 MIN_PAUSE = 60.0
+
+
+def plan_limit(text: str, now: float | None = None) -> tuple[float, bool] | None:
+    """(epoch until the plan is out, whether the message NAMED that time), or None when `text` is not a usage limit.
+
+    HeartCode's message carries no time ("Usage limit reached. Review your plan or this app's limit in ChatGPT settings", seen
+    13 times in video-4), Codex's does ("try again at 7:06 PM"). Without a time the caller backs off (see `Judge._plan_limit`)."""
+    if not text or not _LIMIT.search(text):
+        return None
+    now = time.time() if now is None else now
+    until = plan_limit_reset(text, now, default=0.0)
+    return (until, True) if until and until > now else (now + DEFAULT_PAUSE, False)
 
 
 def plan_limit_reset(text: str, now: float | None = None, default: float = DEFAULT_PAUSE) -> float | None:
