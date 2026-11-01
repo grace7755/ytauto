@@ -58,3 +58,16 @@ def test_effort_comparison_counts_time_relevance_and_flag_disagreements():
     assert r["relevance_within_tol"] == 2
     assert r["flag_disagreements"] == {"presenter_on_camera": 1, "watermark_or_logo": 1}
     assert r["clips_with_any_flag_disagreement"] == 2
+
+
+def test_effort_disagreements_name_the_clip_the_flag_and_both_answers():
+    e = _load("measure_effort")
+    ref = [{"ai_or_animated": False}, {"ai_or_animated": True}, {"ai_or_animated": False}]
+    other = [{"ai_or_animated": True}, {"ai_or_animated": True}, {"ai_or_animated": False}]
+    assert e.disagreements(ref, other, [6, 19, 50]) == ["shot 6: ai_or_animated False -> True"]
+
+
+def test_the_same_level_twice_keeps_two_separate_runs():
+    """`--levels medium medium` is the noise floor; both runs must be stored apart (they used to share one key)."""
+    src = (ROOT / "scripts" / "measure_effort.py").read_text(encoding="utf-8")
+    assert "runs: list[list[dict]]" in src and "out: dict[str, list[dict]]" not in src
