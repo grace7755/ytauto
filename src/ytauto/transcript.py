@@ -53,15 +53,48 @@ def parse_text(raw: str) -> list[Segment]:
     return out
 
 
+_SENTENCE_END = (".", "?", "!")
+JOIN_MIN_PUNCTUATED = 0.7      # only treat a missing full stop as a cut-off when most cues have one
+JOIN_MAX_SECONDS = 20.0        # never let one missing full stop swallow a whole section
+
+
+def join_cut_sentences(segs: list[Segment]) -> list[Segment]:
+    """Join a cue that stops mid-sentence onto the next one.
+
+    Subtitle tools break cues on a character or time limit (ElevenLabs: max 6 s per cue), so a
+    sentence can end up as `...fires single shots, or full` + `auto.`. Each piece became its own shot
+    with its own search and its own picture - one was 0.26 s long. Measured on a 7:33 voice-over: 99
+    cues (130 shots, 87 under 3 s, shortest 0.26 s) became 81 cues (113 shots, shortest 1.58 s).
+
+    Guarded so scripts written without end punctuation are never touched: this runs only when at
+    least `JOIN_MIN_PUNCTUATED` of the cues already end in . ? or !, and a join never grows a cue
+    past `JOIN_MAX_SECONDS`."""
+    if len(segs) < 2:
+        return segs
+    ends = sum(1 for s in segs if s.text.rstrip().endswith(_SENTENCE_END))
+    if ends / len(segs) < JOIN_MIN_PUNCTUATED:
+        return segs
+    out: list[Segment] = []
+    for s in segs:
+        prev = out[-1] if out else None
+        if (prev is not None and not prev.text.rstrip().endswith(_SENTENCE_END)
+                and s.end - prev.start <= JOIN_MAX_SECONDS):
+            out[-1] = Segment(idx=prev.idx, start=prev.start, end=s.end, text=f"{prev.text.rstrip()} {s.text.lstrip()}")
+        else:
+            out.append(s)
+    return [Segment(idx=i, start=s.start, end=s.end, text=s.text) for i, s in enumerate(out)]
+
+
 def load_transcript(path: Path) -> list[Segment]:
     text = path.read_text(encoding="utf-8")
     if path.suffix.lower() == ".json":
         data = json.loads(text)
-        return [Segment(idx=i, start=float(d["start"]), end=float(d["end"]), text=d["text"]) for i, d in enumerate(data)]
+        return join_cut_sentences(
+            [Segment(idx=i, start=float(d["start"]), end=float(d["end"]), text=d["text"]) for i, d in enumerate(data)])
     segs = parse_text(text)
     if not segs:
         raise ValueError(f"No timestamped segments found in {path}")
-    return segs
+    return join_cut_sentences(segs)
 
 
 def split_shots(segments: list[Segment], target: float = 4.5, smin: float = 3.0, smax: float = 6.0) -> list[Shot]:
