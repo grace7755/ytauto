@@ -130,6 +130,12 @@ def main():
             hit.append(idx)
     print(f"   shots that got an accepted clip: {len(hit)}; attempt index of the accept, median "
           f"{sorted(hit)[len(hit) // 2] if hit else '-'}")
+    dead = {sid: v for sid, v in by_shot.items() if not any(r["status"] == "accepted" for r in v)}
+    n_dead = sum(len(v) for v in dead.values())
+    by_prov = Counter(r["provider"] for v in dead.values() for r in v)
+    print(f"   shots with NO accepted clip: {len(dead)} of {len(by_shot)}; they used {n_dead} of {len(judged)} "
+          f"attempts ({100 * n_dead / len(judged):.0f}%), median {sorted(len(v) for v in dead.values())[len(dead) // 2] if dead else 0} each")
+    print("   those attempts by provider: " + ", ".join(f"{p} {n}" for p, n in by_prov.most_common()))
     print("   cap N per shot -> attempts saved / accepted clips lost")
     for n in CAPS:
         saved = sum(max(0, len(v) - n) for v in by_shot.values())

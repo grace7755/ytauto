@@ -241,6 +241,7 @@ Plan (A: stop wasted searching, B: footage -> photo -> category -> graphic ladde
 - `Mixkit.keyword_ladder` no longer ends on an unconditional "nature": every gun shot fell through to it and one waterfall clip was judged for 55 shots (Mixkit 1 accepted / 227).
 - `youtube.is_gone` treats "Sign in to confirm your age" as permanent (cached in `yt_gone`); the bot check ("not a bot") stays transient. One ID was looked up 62 times.
 - `Decision.run` ("run" / "redo-<n>") on every ledger row; `logs/timings-redo-<n>.json` and `logs/judge-links*.json` (answers per judge link) per pass.
+- Film-wide stock skip (`Selector._skip_irrelevant`, `stock_skip_after: 2`, `stock_skip_relevance: 25`, in `_stock` and `_still`): a stock/still item judged irrelevant on 2+ OTHER shots is not tried again unless its title shares a word with the shot's subject. Replayed on video-4's first pass: 206 of 827 stock/still attempts skipped, 0 accepted clips lost. Note the measured per-shot attempt counts: median 6, max 22 (judged attempts, screen-only rejects excluded), so a per-shot attempt cap is a weak lever (cap 16 saves 3%); the budget belongs in the ladder (footage -> photo -> category -> graphic).
 - `scripts/measure_attempts.py <project> [--before ISO | --run run]`: yield per provider, stock items tried on many shots, what the film-wide stock skip and a per-shot attempt cap would save and lose. Thresholds for those fixes come from its output.
 
 ## Working in Claude Code (moved back from Nibedita, 31 Oct 2026)

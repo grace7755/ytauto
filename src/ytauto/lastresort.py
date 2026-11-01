@@ -203,6 +203,8 @@ class LastResort:
                     key = f"{c.provider}:{c.source_id}"
                     if any(t.startswith(key + ":") for t in self._tried(shot)):
                         continue
+                    if self._skip_irrelevant(c, shot):
+                        continue
                     win = (0.0, 1e6)
                     if not self._claim(key, win, shot.id):          # a picture is used once per project
                         continue

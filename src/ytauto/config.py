@@ -89,6 +89,10 @@ class Settings(BaseModel):
     rounds_per_shot: int = 2
     # clips downloaded and judged per shot in one select() before YouTube is given up (0 = no budget); see Selector._over_budget
     max_downloads_per_shot: int = 8
+    # film-wide stock skip: a stock/still item judged irrelevant (relevance <= stock_skip_relevance) on this many OTHER
+    # shots is not tried again unless its title shares a word with the shot's subject. 0 = off
+    stock_skip_after: int = 2
+    stock_skip_relevance: float = 25.0
     # "storyboard": judge the video's seek-bar preview sheet (~12 s, ~3k tokens, any vision link);
     # "url": the judge watches the YouTube URL (~50 s, ~240k tokens, YouTube-capable links only).
     # "storyboard_only": as storyboard, but a video without one is skipped instead of URL-screened

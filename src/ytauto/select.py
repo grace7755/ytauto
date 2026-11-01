@@ -2,6 +2,7 @@
 then stock fallbacks (Pexels -> Pixabay -> Coverr -> Mixkit) for that shot only."""
 from __future__ import annotations
 
+import re
 import threading
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
@@ -41,6 +42,14 @@ BAD_FLAGS = {"presenter_on_camera": "creator/presenter on camera", "ai_or_animat
 VIDEO_DEFECTS = {"watermark / channel logo": 1, "AI-generated / animated / CGI": 2, "burnt-in text": 2}
 
 
+_WORD = re.compile(r"[a-z0-9]+")
+
+
+def _words(text: str) -> set[str]:
+    """Significant lower-case words (4+ letters) for the film-wide stock skip."""
+    return {w for w in _WORD.findall((text or "").lower()) if len(w) >= 4}
+
+
 class Selector(LastResort):
     def __init__(self, s: Settings, proj: Project, cache: Cache, yt: YouTube, gem: Judge | None,
                  providers: dict[str, Provider], shots: list[Shot]):
@@ -57,6 +66,7 @@ class Selector(LastResort):
         self._reusing: set[tuple] = set()      # clips being reused right now (never more than reuse_max_uses)
         self._photos = None                     # still-picture providers, built on first use
         self._dl_pool: ThreadPoolExecutor | None = None   # background section downloads (download_ahead)
+        self._low_rel: dict[str, set[int]] | None = None   # stock/still item -> shots it was judged irrelevant for
 
     # ------------------------------------------------------------------
     # -- channel reputation ------------------------------------------------------
@@ -97,9 +107,52 @@ class Selector(LastResort):
                      clip_path=str(clip) if clip else "", score=score, hard_rejects=rejects or [], notes=notes,
                      credit=c.channel if c.provider.startswith("still_") else "")
         self.proj.log_decision(d)
+        if status == "rejected" and c.provider != "youtube":
+            self._remember_low(d)
         if status == "accepted" and clip is not None:
             self._to_library(shot, c, d, clip)
         return d
+
+    # -- film-wide memory of irrelevant stock ---------------------------------------------------
+    # `_tried(shot)` only knows what was tried for THIS shot, so a stock clip judged irrelevant for one shot was
+    # fetched, cut and AI-judged again for the next. Video-4 (Russian firearms, 127 shots): one Mixkit waterfall
+    # was tried for 53 shots, 442 stock/still rejects had relevance <= 20. Replayed on that ledger
+    # (scripts/measure_attempts.py), skipping an item after 2 low-relevance rejects on other shots would have
+    # skipped 206 of 827 stock/still attempts and lost 0 accepted clips.
+    def _low_relevance(self) -> dict[str, set[int]]:
+        with self._lock:
+            if self._low_rel is None:
+                self._low_rel = defaultdict(set)
+                for d in self.proj.ledger():
+                    self._add_low(d)
+            return self._low_rel
+
+    def _add_low(self, d: Decision):
+        if d.status == "rejected" and d.provider != "youtube" and d.score is not None \
+                and d.score.relevance <= self.s.stock_skip_relevance:
+            self._low_rel[f"{d.provider}:{d.source_id}"].add(d.shot)
+
+    def _remember_low(self, d: Decision):
+        self._low_relevance()                          # built from the ledger first
+        with self._lock:
+            self._add_low(d)
+
+    def _skip_irrelevant(self, c: Candidate, shot: Shot) -> bool:
+        """Was this stock/still item already judged irrelevant on `stock_skip_after` other shots? It is still
+        allowed when its title or tags share a word with this shot's subject: the same clip can be right for
+        a later shot."""
+        if self.s.stock_skip_after <= 0:
+            return False
+        others = self._low_relevance().get(f"{c.provider}:{c.source_id}", set()) - {shot.id}
+        if len(others) < self.s.stock_skip_after:
+            return False
+        b = shot.brief
+        subject = _words(" ".join([b.subject, *b.entities])) if b else set()
+        if subject & _words(" ".join([c.title, *c.tags])):
+            return False
+        log.debug("shot %d: skipping %s:%s (judged irrelevant on %d other shots)", shot.id, c.provider,
+                  c.source_id, len(others))
+        return True
 
     # -- shared footage library (library.py) ------------------------------------------
     def _library(self):
@@ -690,6 +743,8 @@ class Selector(LastResort):
                         continue
                     key = f"{c.provider}:{c.source_id}"
                     if any(t.startswith(key + ":") for t in self._tried(shot)):
+                        continue
+                    if self._skip_irrelevant(c, shot):
                         continue
                     win = (0.0, 1e6)                      # the whole file: a stock clip is used once per project
                     if not self._claim(key, win, shot.id):
