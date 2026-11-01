@@ -298,3 +298,81 @@ def test_a_real_run_pauses_every_chatgpt_link_for_the_backoff_time(monkeypatch, 
     for l in _chain()[:2]:
         assert 14 * 60 < j.quota.out_until(l) - _t.time() <= 15 * 60 + 5
     assert [m for m, _ in heart.asked] == [LUNA]
+
+
+# --- "AI-made?" needs two agreeing answers before it rejects (Luna flipped on 4 of 24 real clips asked twice) -----
+def _ai_judge(monkeypatch, tmp_path, answers, votes=2, calls=None):
+    heart = FakeHeart()
+    j = _judge(monkeypatch, tmp_path, _chain()[:1], heart, ai_check_votes=votes)
+    monkeypatch.setattr(R, "extract_grid_data_url", lambda *a, **k: "data:image/jpeg;base64,QUJD")
+    seq = list(answers)
+    seen = calls if calls is not None else []
+
+    def post(link, content, schema, timeout=None, **kw):
+        seen.append(link.model)
+        v = seq.pop(0)
+        if isinstance(v, Exception):
+            raise v
+        return json.dumps({"ai_generated": v})
+    monkeypatch.setattr(j, "_post", post)
+    return j, seen
+
+
+def test_a_real_answer_stands_after_one_call(monkeypatch, tmp_path):
+    j, seen = _ai_judge(monkeypatch, tmp_path, [False])
+    assert j.confirm_ai_generated(tmp_path / "c.mp4", cache_key=("k", 1)) is False
+    assert len(seen) == 1, "no extra call for the usual case"
+
+
+def test_an_ai_answer_is_asked_again_and_a_real_second_answer_clears_the_clip(monkeypatch, tmp_path):
+    j, seen = _ai_judge(monkeypatch, tmp_path, [True, False])
+    assert j.confirm_ai_generated(tmp_path / "c.mp4", cache_key=("k", 2)) is False
+    assert len(seen) == 2
+    assert j.confirm_ai_generated(tmp_path / "c.mp4", cache_key=("k", 2)) is False, "the final answer is what gets remembered"
+    assert len(seen) == 2
+
+
+def test_two_ai_answers_reject_the_clip(monkeypatch, tmp_path):
+    j, seen = _ai_judge(monkeypatch, tmp_path, [True, True])
+    assert j.confirm_ai_generated(tmp_path / "c.mp4", cache_key=("k", 3)) is True
+    assert len(seen) == 2
+
+
+def test_an_unavailable_second_answer_leaves_the_first_standing(monkeypatch, tmp_path):
+    j, seen = _ai_judge(monkeypatch, tmp_path, [True, JudgeErr("boom")])
+    j.chain = j.chain[:1]
+    assert j.confirm_ai_generated(tmp_path / "c.mp4", cache_key=("k", 4)) is True
+
+
+def test_one_vote_is_the_old_single_answer_behaviour(monkeypatch, tmp_path):
+    j, seen = _ai_judge(monkeypatch, tmp_path, [True], votes=1)
+    assert j.confirm_ai_generated(tmp_path / "c.mp4", cache_key=("k", 5)) is True
+    assert len(seen) == 1
+
+
+def JudgeErr(msg):
+    return R.JudgeError(msg)
+
+
+def test_a_still_flagged_as_ai_is_asked_again_before_it_is_rejected(tmp_path):
+    from ytauto.inspect import verify as V
+
+    class G:
+        class s:
+            ai_check_votes = 2
+        cache = Cache(tmp_path)
+        asked = 0
+
+        def json_images(self, prompt, images, schema, cache_key=None, task=""):
+            if schema is V.STILL_AI_SCHEMA:
+                G.asked += 1
+                return {"ai_generated": G.asked == 1, "evidence": "x"}
+            return {"relevance": 90, "authenticity": 90, "ai_or_animated": False}
+    img = tmp_path / "p.jpg"
+    from PIL import Image
+    Image.new("RGB", (64, 64), (200, 10, 10)).save(img)
+    from ytauto.models import Brief, Shot
+    sh = Shot(id=0, segment=0, start=0, end=4, text="t", brief=Brief(subject="rifle"))
+    v = V.verify_still(G(), img, sh, "p:1", 60.0)
+    assert G.asked == 2, "the AI answer was asked again"
+    assert v["ai_or_animated"] is False, "and the real second answer cleared the picture"

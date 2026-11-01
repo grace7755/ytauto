@@ -106,7 +106,7 @@ def verify_clip(gem: Judge, clip: Path, shot: Shot, cache_id: str,
     # `ai_or_animated` inside the 12-field verdict is unreliable in both directions: measured on
     # five known clips it called a real Tokyo skyline synthetic AND passed a generated Fuji clip.
     # A dedicated single-question check scored 4/4 on the same clips, so it decides this flag.
-    dedicated = gem.confirm_ai_generated(clip, cache_key=("aicheck", cache_id))
+    dedicated = gem.confirm_ai_generated(clip, cache_key=("aicheck-v2", cache_id))
     if dedicated is not None and dedicated != bool(v.get("ai_or_animated")):
         log.info("%s: AI flag %s -> %s by the dedicated check",
                  clip.name, bool(v.get("ai_or_animated")), dedicated)
@@ -155,7 +155,13 @@ def verify_still(gem: Judge, image: Path, shot: Shot, cache_id: str, min_relevan
         return None
     if not needs_ai_check(v, min_relevance):
         return v
-    ai = gem.json_images(STILL_AI_PROMPT, [jpeg], STILL_AI_SCHEMA, cache_key=("aicheck-still", cache_id), task="aicheck")
+    ai = gem.json_images(STILL_AI_PROMPT, [jpeg], STILL_AI_SCHEMA, cache_key=("aicheck-still-v2", cache_id), task="aicheck")
+    if isinstance(ai, dict) and ai.get("ai_generated") and getattr(getattr(gem, "s", None), "ai_check_votes", 1) >= 2:
+        # same rule as for clips (Judge.confirm_ai_generated): an "AI" answer must be repeated before it rejects the picture
+        again = gem.json_images(STILL_AI_PROMPT, [jpeg], STILL_AI_SCHEMA, task="aicheck")      # no cache_key: a fresh answer
+        if isinstance(again, dict) and "ai_generated" in again and not again["ai_generated"]:
+            ai = dict(ai, ai_generated=False, evidence=(ai.get("evidence") or "") + " [second answer: real]")
+        gem.cache.set("judge", ai, "aicheck-still-v2", cache_id)
     if isinstance(ai, dict) and "ai_generated" in ai:
         v["ai_or_animated"] = bool(ai["ai_generated"])
         v["notes"] = (v.get("notes") or "") + f" [dedicated AI check: {bool(ai['ai_generated'])}]"

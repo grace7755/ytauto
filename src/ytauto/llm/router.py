@@ -780,6 +780,12 @@ class Judge:
         check scored 4/4, while the combined verdict produced confident errors in both directions
         (a real Tokyo skyline called synthetic at 95% confidence, and a generated clip passed).
         Returns None when no provider could answer.
+
+        TWO ANSWERS before a clip is called AI (`ai_check_votes: 2`). The answer decides a hard reject, and GPT Luna does not
+        give the same answer twice: the same prompt on the same 24 real clips, run twice, flipped on 4 of them
+        (`scripts/measure_effort.py --levels medium medium`), so noise alone would reject about 1 real clip in 12 and
+        `bad_video` would ban the whole video. A "real" answer stands at once (one call); an "AI" answer is asked again and
+        the clip is called AI only if the second answer agrees. A second answer that cannot be had leaves the first standing.
         """
         if cache_key is not None:
             hit = self.cache.get("judge", *cache_key)
@@ -790,8 +796,22 @@ class Judge:
         if data_url is None:
             return None
         question = self.AI_CHECK_PROMPT.format(n=cols * rows)
-        prompt = question + _schema_hint(self.AI_CHECK_SCHEMA)
+        first = self._ai_vote(data_url, question)
+        verdict, votes = first, [first]
+        if first and self.s.ai_check_votes >= 2:
+            second = self._ai_vote(data_url, question)
+            votes.append(second)
+            if second is not None:
+                verdict = bool(second)                      # both said AI -> AI; the second said real -> real
+                if not second:
+                    log.info("AI check: a second answer said real for %s (first said AI); not rejected", Path(clip).name)
+        if verdict is not None and cache_key is not None:
+            self.cache.set("judge", {"ai_generated": verdict, "votes": votes}, *cache_key)
+        return verdict
 
+    def _ai_vote(self, data_url: str, question: str) -> bool | None:
+        """One AI-made answer from the first link that can give one (None when none can)."""
+        prompt = question + _schema_hint(self.AI_CHECK_SCHEMA)
         for link in self._live(need_vision=True):
             if self.quota.out_until(link):              # paused a moment ago (e.g. the plan-wide limit)
                 continue
@@ -815,8 +835,6 @@ class Judge:
                 self._trip(link, str(e))
                 continue
             self._answered(link)
-            if cache_key is not None:
-                self.cache.set("judge", data, *cache_key)
             return bool(data.get("ai_generated"))
         return None
 

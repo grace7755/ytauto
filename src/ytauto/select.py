@@ -886,7 +886,7 @@ class Selector(LastResort):
         if not self.gem or AI_DEFERRED not in d.notes:
             return False
         cache_id = f"{d.provider}:{d.source_id}:{int(d.src_start)}"
-        if not self.gem.confirm_ai_generated(Path(d.clip_path), cache_key=("aicheck", cache_id)):
+        if not self.gem.confirm_ai_generated(Path(d.clip_path), cache_key=("aicheck-v2", cache_id)):
             return False
         log.info("shot %d: weak candidate %s is AI-generated; dropped", shot.id, Path(d.clip_path).name)
         self.proj.log_decision(d.model_copy(update={

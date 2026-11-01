@@ -164,6 +164,9 @@ class Settings(BaseModel):
     # reasoning effort per task (plan, critic, screen, verify, aicheck, review, facts): low | medium | high.
     # Empty = every tool's own default. Set from a measurement (scripts/measure_effort.py), not by guess.
     judge_effort: dict[str, str] = Field(default_factory=dict)
+    # answers needed before a clip or photo is rejected as AI-generated: 2 = an "AI" answer is asked again and must be repeated
+    # (GPT Luna flipped on 4 of 24 real clips when asked twice); 1 = the old single answer
+    ai_check_votes: int = 2
     # local face check on the storyboard tiles the judge picked: a presenter-sized face only moves a tile /
     # video to the back of the queue (never rejects). Off until measured on your ledgers:
     # scripts/measure_face_tiles.py
