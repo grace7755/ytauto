@@ -34,6 +34,14 @@ class Brief(BaseModel):
     # narration names no specific place, person, event or landmark: stock is tried before YouTube
     # (faster, licence-clean, no AI-footage ban risk). See `Settings.stock_first`.
     generic: bool = False
+    # Decided up front (Round 6 visual ladder): what kind of picture this line needs. footage = video (default, the old
+    # behaviour); photo = a still of the named thing first (an obscure product rarely exists as clean footage); graphic = a
+    # card drawn over a background (spec numbers, a quote, a list). Graphics are drawn by Remotion; until those cards exist
+    # (`graphics_enabled`), a graphic shot is filled like a footage shot.
+    visual_kind: str = "footage"
+    graphic: str = ""                      # spec | quote | list | compare | diagram | map (visual_kind == "graphic")
+    # Set only on a category-fallback brief: the exact subject this broader category stands in for.
+    category_of: str = ""
 
     def names(self) -> str:
         """The prompts' "names involved" line, with the setting as a hard requirement."""

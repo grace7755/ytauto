@@ -49,6 +49,9 @@ def run(transcript: Path, title: Optional[str] = typer.Option(None, help="Projec
         typer.echo(f"\nvideo : {p.proj.path('output', 'final.mp4')}")
     typer.echo(f"report: {p.proj.path('report.html')}")
     typer.echo(f"share of running time: {data['shares']}   clips used twice: {len(data['reused_clips'])}")
+    subs = {k: v for k, v in (data.get("substitutions") or {}).items() if v}
+    if subs:
+        typer.echo(f"not the exact subject as video (photo / category / reuse / weak): {subs}")
     for prob in data["reuse_problems"]:
         typer.echo(f"REUSE RULE BROKEN: {prob}")
     typer.echo(f"sources: {data['provider_counts']}   weak/missing shots: {[r['shot'] for r in bad]}")

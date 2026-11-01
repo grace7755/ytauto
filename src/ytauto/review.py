@@ -31,6 +31,16 @@ below 60 = unrelated or the wrong place/thing. Add a short `why` (under 15 words
 Be strict: a pretty frame of the wrong subject is a low score."""
 
 
+def _category_note(proj: Project, sh: Shot) -> str:
+    """A category-fallback clip is judged on its category, as verify judged it (otherwise the review rates every one of them
+    under 60 again and the reviewer redoes a shot that has no better footage)."""
+    d = proj.accepted(sh.id)
+    if not d or "CATEGORY FALLBACK:" not in (d.notes or ""):
+        return ""
+    cat = d.notes.split("CATEGORY FALLBACK:", 1)[1].split("(for", 1)[0].strip()
+    return f"  (no footage of the exact subject exists; a clear shot of {cat} counts as showing it)"
+
+
 def frame_of(clip: Path):
     """The middle frame of a clip as a PIL image (what CLIP compares), or None."""
     f = _frame(clip)
@@ -73,7 +83,7 @@ def review(gem: Judge, proj: Project, shots: list[Shot], per: int = 10) -> list[
     out = []
     for i in range(0, len(items), per):
         batch = items[i:i + per]
-        lines = "\n".join(f"[{sh.id}] {sh.text}" for sh, _ in batch)
+        lines = "\n".join(f"[{sh.id}] {sh.text}{_category_note(proj, sh)}" for sh, _ in batch)
         res = gem.json_images(PROMPT.format(n=len(batch), lines=lines), [sheet([(sh.id, f) for sh, f in batch])],
                               REVIEW_SCHEMA, cache_key=("review-v1", lines, tuple(proj.accepted(sh.id).clip_path for sh, _ in batch)),
                               task="review")

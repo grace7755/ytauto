@@ -21,6 +21,7 @@ from .lastresort import REUSED, LastResort  # noqa: F401  (REUSED: re-exported f
 from .llm.router import Judge, JudgeError, QuotaExhausted
 from .log import log
 from .models import Candidate, ClipScore, Decision, Shot
+from .planner import generalise_brief
 from .screen import screen, screen_storyboards
 from .sources.stock import Provider
 from .sources.youtube import YouTube, text_score
@@ -43,6 +44,7 @@ VIDEO_DEFECTS = {"watermark / channel logo": 1, "AI-generated / animated / CGI":
 
 
 _WORD = re.compile(r"[a-z0-9]+")
+CATEGORY = "CATEGORY FALLBACK:"          # in a decision's notes: the clip shows the category, not the exact subject
 
 
 def _words(text: str) -> set[str]:
@@ -102,6 +104,10 @@ class Selector(LastResort):
     def _decide(self, shot: Shot, c: Candidate, status: str, *, clip: Path | None = None, win=(0.0, 0.0),
                 score: ClipScore | None = None, rejects: list[str] | None = None, notes: str = "") -> Decision:
         self._note_channel(c, status, rejects or [])
+        if shot.brief is not None and shot.brief.category_of:
+            # disclosed, never silent: the report, the reviewer and qa can see this clip shows the category
+            mark = f"{CATEGORY} {shot.brief.subject} (for {shot.brief.category_of})"
+            notes = f"{notes} | {mark}" if notes else mark
         d = Decision(shot=shot.id, status=status, provider=c.provider, source_id=c.source_id, url=c.url,
                      title=c.title, license=c.license, src_start=round(win[0], 2), src_end=round(win[1], 2),
                      clip_path=str(clip) if clip else "", score=score, hard_rejects=rejects or [], notes=notes,
@@ -634,18 +640,27 @@ class Selector(LastResort):
         return sum(1 for d in self.proj.ledger() if d.shot == shot.id and d.status in ("accepted", "rejected", "weak")
                    and not any(r.startswith("screen") for r in d.hard_rejects))
 
-    def _over_budget(self, shot: Shot) -> bool:
+    def _over_budget(self, shot: Shot, cap: int | None = None) -> bool:
         """Has this select() already spent `max_downloads_per_shot` downloads on the shot? Measured on the
         Philippines run: 14 of 87 shots took more than 8 downloads (up to 25), and 10 of those 14 still ended as
         weak matches - the extra downloads bought nothing. Past the budget the shot moves on to stock, a still,
         a reuse or a weak match. 0 = no budget."""
-        cap = self.s.max_downloads_per_shot
+        cap = self.s.max_downloads_per_shot if cap is None else cap
         return cap > 0 and self._downloads(shot) - self._dl_base.get(shot.id, 0) >= cap
 
-    def _youtube(self, shot: Shot, best: list) -> Decision | None:
+    def _over_attempts(self, shot: Shot, cap: int | None = None) -> bool:
+        """Visual ladder: has this shot spent its judged-attempt budget (YouTube + stock)? Then it moves on to a photo, the
+        category rewrite or a reuse instead of trying more of the same (video-4 replay: median 6 judged attempts per shot,
+        max 22; shots with no accepted clip spent the most). Only stock checks it: YouTube keeps `max_downloads_per_shot`."""
+        if not self.s.visual_ladder:
+            return False
+        cap = self.s.shot_attempts_budget if cap is None else cap
+        return cap > 0 and self._downloads(shot) - self._dl_base.get(shot.id, 0) >= cap
+
+    def _youtube(self, shot: Shot, best: list, rounds: int | None = None, cap: int | None = None) -> Decision | None:
         tried = self._tried(shot)
-        for rnd in range(self.s.rounds_per_shot):
-            if self._over_budget(shot):
+        for rnd in range(rounds or self.s.rounds_per_shot):
+            if self._over_budget(shot, cap):
                 log.info("shot %d: %d downloads without a usable clip; leaving YouTube", shot.id, self.s.max_downloads_per_shot)
                 break
             cands = self._youtube_candidates(shot, rnd)[: self.s.screen_top_k * 3]
@@ -704,7 +719,7 @@ class Selector(LastResort):
                 if window is None:
                     continue                             # every window is taken or already tried
                 (window, prior) = window
-                if self._over_budget(shot):
+                if self._over_budget(shot, cap):
                     self._release(key, window)
                     log.info("shot %d: download budget spent; leaving YouTube", shot.id)
                     return None
@@ -726,7 +741,7 @@ class Selector(LastResort):
                     best.append(d)       # only soft failures (score/relevance) can become a weak fallback
         return None
 
-    def _stock(self, shot: Shot, best: list) -> Decision | None:
+    def _stock(self, shot: Shot, best: list, cap: int | None = None) -> Decision | None:
         b = shot.brief
         queries = (b.stock_queries or [shot.text])[:2]
         limit = self.s.stock_tries_per_provider
@@ -739,6 +754,9 @@ class Selector(LastResort):
                 for c in prov.search(q, 6):
                     if tried >= limit:
                         break
+                    if self._over_attempts(shot, cap):
+                        log.info("shot %d: attempt budget spent; leaving stock", shot.id)
+                        return None
                     if (c.height or 1080) < self.s.min_clip_height:
                         continue
                     key = f"{c.provider}:{c.source_id}"
@@ -850,15 +868,24 @@ class Selector(LastResort):
         best: list[Decision] = []
         self._dl_base[shot.id] = self._downloads(shot)
         d = self._sibling(shot) or self._from_library(shot)
+        photo_first = self.s.visual_ladder and shot.brief is not None and shot.brief.visual_kind == "photo"
         if not d:
-            if shot.brief is not None and shot.brief.generic and self.s.stock_first:
+            if photo_first:
+                # a named product rarely exists as clean footage: its photo first, then one quick YouTube round, then stock
+                d = self._still(shot) or self._youtube(shot, best, rounds=1) or self._stock(shot, best)
+            elif shot.brief is not None and shot.brief.generic and self.s.stock_first:
                 d = self._stock(shot, best) or self._youtube(shot, best)
             else:
                 d = self._youtube(shot, best) or self._stock(shot, best)
         if d:
             self._cleanup(shot, keep=d, best=best)
             return d
-        d = self._crop_logo(shot) or self._still(shot) or self._reuse(shot)   # all of them beat a weak match
+        if self.s.visual_ladder:
+            # every step beats a weak match; a photo of the exact thing beats a clip of its category
+            d = (self._crop_logo(shot) or (None if photo_first else self._still(shot))
+                 or self._category(shot, best) or self._reuse(shot))
+        else:
+            d = self._crop_logo(shot) or self._still(shot) or self._reuse(shot)   # all of them beat a weak match
         if d:
             self._cleanup(shot, keep=d, best=best)
             return d
@@ -878,6 +905,25 @@ class Selector(LastResort):
             return weak
         log.error("shot %d: no footage found anywhere", shot.id)
         return None
+
+    def _category(self, shot: Shot, best: list) -> Decision | None:
+        """Query relaxation: the exact subject found nothing close, so search once for its category ("PPK-20 blowback action" ->
+        "submachine gun bolt cycling"). Only when nothing relevant turned up (best relevance below the trigger): a near miss of
+        the real thing still wins as a weak match. A small budget of its own; every clip is marked CATEGORY FALLBACK."""
+        b = shot.brief
+        if not (self.s.visual_ladder and self.s.category_fallback and self.gem and b is not None) or b.generic or b.category_of:
+            return None
+        top = max((x.score.relevance for x in best if x.score), default=0.0)
+        if top >= self.s.category_trigger_relevance:
+            return None
+        nb = generalise_brief(self.gem, shot)
+        if nb is None:
+            return None
+        log.info("shot %d: nothing close to %r; trying its category %r", shot.id, b.subject, nb.subject)
+        alt = shot.model_copy(update={"brief": nb})
+        self._dl_base[shot.id] = self._downloads(shot)          # a fresh, small budget for this step
+        cap = self.s.category_attempts
+        return self._youtube(alt, best, rounds=1, cap=cap) or self._stock(alt, best, cap=cap)
 
     def _ai_flagged(self, shot: Shot, d: Decision) -> bool:
         """Run the AI-footage check that `verify_clip` deferred for this clip, now that it is about

@@ -71,3 +71,14 @@ def test_the_same_level_twice_keeps_two_separate_runs():
     """`--levels medium medium` is the noise floor; both runs must be stored apart (they used to share one key)."""
     src = (ROOT / "scripts" / "measure_effort.py").read_text(encoding="utf-8")
     assert "runs: list[list[dict]]" in src and "out: dict[str, list[dict]]" not in src
+
+
+def test_photo_coverage_uses_the_photo_steps_queries_and_counts_covered_shots():
+    m = _load("measure_photo_coverage")
+    assert m.queries_for({"subject": "PPK-20", "setting": "Russia", "stock_queries": ["smg", "gun"]}) == \
+        ["PPK-20 Russia", "PPK-20", "smg"]
+    assert m.queries_for({"subject": "reef", "stock_queries": ["reef"]}) == ["reef"]
+    hits = {1: {"commons": 3, "pexels": 0}, 2: {"commons": 0, "pexels": 0}, 3: {"commons": 0, "pexels": 2}}
+    r = m.summarise(hits, {1: "photo", 2: "photo", 3: "footage"})
+    assert r["all"]["any"] == (2, 3) and r["all"]["commons"] == (1, 3)
+    assert r["photo"]["any"] == (1, 2) and r["footage"]["pexels"] == (1, 1)

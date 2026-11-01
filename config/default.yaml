@@ -27,6 +27,12 @@ reuse_min_gap: 60
 reuse_tries: 2          # earlier clips (best CLIP match first) judged for the new shot
 rounds_per_shot: 2      # fresh-query retries on YouTube before stock fallback
 max_downloads_per_shot: 8  # then stop downloading for the shot: stock, still, reuse, weak (Philippines: 14 shots took 8+, 10 of them ended weak). 0 = off
+visual_ladder: true         # Round 6: photo-first for named products, attempt budget, category fallback. false = the exact old order
+shot_attempts_budget: 12    # judged attempts per shot (YouTube + stock) before the photo / category / reuse steps. 0 = off
+category_fallback: true     # nothing close found (best relevance < category_trigger_relevance): one search for the category, marked CATEGORY FALLBACK
+category_trigger_relevance: 50
+category_attempts: 4
+graphics_enabled: false     # graphic shots stay footage shots until the Remotion cards exist
 
 # ---- speed ------------------------------------------------------------------
 # storyboard: judge the video's seek-bar preview sheet (~12 s, ~3k tokens per candidate)

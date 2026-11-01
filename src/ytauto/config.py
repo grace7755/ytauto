@@ -114,6 +114,18 @@ class Settings(BaseModel):
     # shots is not tried again unless its title shares a word with the shot's subject. 0 = off
     stock_skip_after: int = 2
     stock_skip_relevance: float = 25.0
+    # Round 6 visual ladder (Selector.select). false = the exact old shot order.
+    visual_ladder: bool = True
+    # judged attempts (YouTube + stock, screen-only rejects excluded) per shot before it moves on to a photo / category /
+    # reuse. video-4 replay: median 6 per shot, a cap of 12 saves 18% of attempts; the shots it stops get the later steps. 0 = off
+    shot_attempts_budget: int = 12
+    # query relaxation: when the exact subject found nothing close (best relevance below the trigger), rewrite the brief once
+    # to its category (planner.generalise_brief) and try a short search; the clip is marked CATEGORY FALLBACK
+    category_fallback: bool = True
+    category_trigger_relevance: float = 50.0
+    category_attempts: int = 4
+    # graphic shots get a Remotion card; off until the DocFilm cards exist (until then a graphic shot is filled like footage)
+    graphics_enabled: bool = False
     # "storyboard": judge the video's seek-bar preview sheet (~12 s, ~3k tokens, any vision link);
     # "url": the judge watches the YouTube URL (~50 s, ~240k tokens, YouTube-capable links only).
     # "storyboard_only": as storyboard, but a video without one is skipped instead of URL-screened

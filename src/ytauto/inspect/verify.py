@@ -61,6 +61,14 @@ when you are unsure, set ai_or_animated = false and explain the doubt in notes."
 _OTHER_REJECTS = ("presenter_on_camera", "watermark_or_logo", "text_overlay", "black_and_white")
 
 
+# A category-fallback brief (planner.generalise_brief): the narration names an exact thing no clean footage exists of.
+CATEGORY_HINT = """
+
+No usable footage of the exact "{exact}" exists, so this shot illustrates its CATEGORY instead. Judge relevance on the
+category: a clip that clearly shows {subject} is relevant (70+) even though it is not that exact model; a different kind
+of thing is still not relevant."""
+
+
 def needs_ai_check(v: dict, min_relevance: float) -> bool:
     """Is the dedicated AI check able to change this clip's outcome? Not if the verdict already
     rejects it for something else: measured on the speed test, 14 of ~35 downloads failed verify
@@ -87,6 +95,8 @@ def verify_clip(gem: Judge, clip: Path, shot: Shot, cache_id: str,
     b = shot.brief
     prompt = PROMPT.format(text=shot.text, subject=b.subject or b.visual, visual=b.visual,
                            entities=b.names())
+    if getattr(b, "category_of", ""):
+        prompt += CATEGORY_HINT.format(exact=b.category_of, subject=b.subject)
     try:
         v = gem.json_video_file(clip, prompt, VERIFY_SCHEMA, fps=2.0,
                                 cache_key=("verify-v2", cache_id, b.subject, b.visual, b.key()), task="verify")

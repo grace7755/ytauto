@@ -47,6 +47,8 @@ PLAN_SCHEMA = {
             "stock_queries": {"type": "array", "items": {"type": "string"}},
             "avoid": {"type": "array", "items": {"type": "string"}},
             "generic": {"type": "boolean", "description": "ordinary b-roll any stock library has; names nothing specific"},
+            "visual_kind": {"type": "string", "description": "footage | photo | graphic"},
+            "graphic": {"type": "string", "description": "spec | quote | list | compare | diagram | map, only for graphic"},
         },
         "required": ["id", "subject", "visual", "entities", "youtube_queries", "stock_queries"]}},
         "topic": {"type": "string", "description": "the one filmable place/subject the video is about"}},
@@ -84,6 +86,11 @@ Return one entry per shot in `shots` (keep id):
   waves, aerial coastline, sunset, forest, rain, a crowd walking, street food being cooked) AND the
   narration names no specific place, person, event, landmark or object. False whenever the shot
   must show something named (a town, a tribe, a volcano, a person, a dish, a festival).
+- visual_kind: "footage" for anything a camera films (a place, an action, a common object) - the default;
+  "photo" when the subject is one specific named product, model or person that is rarely filmed cleanly
+  (a particular gun model, a prototype, a historic figure); "graphic" when the line is mostly numbers or
+  specifications, a quote, a list, or speaks to the viewer ("tell us in the comments"). graphic: spec | quote | list |
+  compare | diagram | map (only with "graphic"). A graphic shot still gets a subject: its background picture.
 
 HARD RULES for `visual` - a brief breaking any of these cannot be filled and wastes the shot:
 1. ONE continuous shot from ONE camera. Never describe a montage, a series, a sequence, quick cuts,
@@ -224,6 +231,92 @@ def _b_roll_queries(briefs: dict[int, Brief]) -> list[str]:
         if out != b.youtube_queries and out:
             briefs[sid] = b.model_copy(update={"youtube_queries": out})
     return fixed
+
+
+VISUAL_KINDS = ("footage", "photo", "graphic")
+GRAPHIC_KINDS = ("spec", "quote", "list", "compare", "diagram", "map")
+# Lines that speak to the viewer or comment on the video: nothing to film, a text card fits.
+_TO_VIEWER = re.compile(r"\b(?:comments?|subscribe|let us know|tell us|which one would you|like this video|hit the bell|"
+                        r"see you (?:in|next)|thanks for watching)\b", re.I)
+# A number with a unit: a specification ("32 inches", "2,600 yards", "20 pounds", "7.1 kilograms", "1,400 dollars", "37%").
+_SPEC = re.compile(r"(?:\$\s?\d|\d[\d,.]*\s*(?:%|percent\b|inch(?:es)?\b|mm\b|millimet|centimet|cm\b|met(?:er|re)s?\b|"
+                   r"km\b|kilomet|miles?\b|yards?\b|feet\b|foot\b|ft\b|pounds?\b|lbs?\b|kilos?\b|kilograms?\b|grams?\b|"
+                   r"rounds?\b|gauge\b|mph\b|km/h|dollars?\b|euros?\b|tons?\b|tonnes?\b|degrees?\b))", re.I)
+
+
+def classify_visual(shots: list[Shot], briefs: dict[int, Brief]) -> list[str]:
+    """Rules first, the model only for the rest: the model does not answer the same way twice (measured on GPT Luna),
+    so the clear cases are decided by code. A line that speaks to the viewer becomes a quote card, a line built on a
+    measurement a spec card; an unknown value from the model falls back to footage. Returns what the rules changed."""
+    changed = []
+    for sh in shots:
+        b = briefs.get(sh.id)
+        if b is None:
+            continue
+        kind = b.visual_kind if b.visual_kind in VISUAL_KINDS else "footage"
+        graphic = b.graphic if b.graphic in GRAPHIC_KINDS else ""
+        if _TO_VIEWER.search(sh.text):
+            kind, graphic = "graphic", "quote"
+        elif _SPEC.search(sh.text):
+            kind, graphic = "graphic", "spec"
+        if kind != "graphic":
+            graphic = ""
+        elif not graphic:
+            graphic = "quote"
+        if (kind, graphic) != (b.visual_kind, b.graphic):
+            briefs[sh.id] = b.model_copy(update={"visual_kind": kind, "graphic": graphic})
+            if (kind, graphic) != (b.visual_kind if b.visual_kind in VISUAL_KINDS else "footage", b.graphic):
+                changed.append(f"shot {sh.id}: {kind}{'/' + graphic if graphic else ''}")
+    return changed
+
+
+GENERALISE_SCHEMA = {"type": "object", "properties": {
+    "subject": {"type": "string"}, "visual": {"type": "string"},
+    "youtube_queries": {"type": "array", "items": {"type": "string"}},
+    "stock_queries": {"type": "array", "items": {"type": "string"}}},
+    "required": ["subject", "youtube_queries", "stock_queries"]}
+
+GENERALISE_PROMPT = """A documentary shot needs footage of "{subject}", but no usable clip of that exact thing exists.
+Narration of the shot: "{text}"
+
+Give the broader CATEGORY a viewer would accept as illustrating this line, filmable as ONE continuous real camera shot in
+one place (e.g. "PPK-20 blowback action" -> "submachine gun bolt cycling in slow motion"; "Orsis AR-15J stainless barrel" ->
+"rifle barrel close up"). Never name the exact model, brand or person. Never ask for a montage, text or a presenter.
+- subject: the category, 2-6 words
+- visual: one sentence describing the ideal shot of it
+- youtube_queries: 3 searches for clean b-roll of the category (words like "b-roll", "slow motion", "close up 4k";
+  never "review", "unboxing", "vs", "tutorial")
+- stock_queries: 2 short searches (2-3 words) for stock sites"""
+
+
+def generalise_brief(gem: Judge, shot: Shot) -> Brief | None:
+    """The category-fallback brief for a shot whose exact subject cannot be found (one cached AI call), or None.
+
+    Query relaxation: only used after the exact subject failed. The result carries `category_of`, so every decision made with it
+    is marked `CATEGORY FALLBACK` and the judge is told the category is acceptable."""
+    b = shot.brief
+    if gem is None or b is None or not (b.subject or "").strip():
+        return None
+    try:
+        data = gem.json(GENERALISE_PROMPT.format(subject=b.subject, text=shot.text), GENERALISE_SCHEMA,
+                        cache_key=("generalise-v1", shot.text, b.subject), task="plan")
+    except QuotaExhausted:
+        raise
+    except Exception as e:                  # a failed rewrite only skips this step
+        log.warning("shot %d: category rewrite failed (%s)", shot.id, str(e)[:120])
+        return None
+    subj = " ".join(str(data.get("subject") or "").split())
+    if not subj or subj.lower() == b.subject.lower():
+        return None
+    yq = [q.strip() for q in data.get("youtube_queries") or [] if isinstance(q, str) and q.strip()][:3]
+    sq = [q.strip() for q in data.get("stock_queries") or [] if isinstance(q, str) and q.strip()][:2]
+    nb = b.model_copy(update={
+        "subject": subj, "visual": str(data.get("visual") or subj), "entities": [],
+        "youtube_queries": yq or [f"{subj} b-roll", f"{subj} close up 4k"], "stock_queries": sq or [subj],
+        "generic": False, "category_of": b.subject, "visual_kind": "footage", "graphic": ""})
+    tmp = {shot.id: nb}
+    _b_roll_queries(tmp)
+    return tmp[shot.id]
 
 
 def _align_queries(shots: list[Shot], briefs: dict[int, Brief], nq: int) -> list[str]:
@@ -434,7 +527,9 @@ def plan(segments: list[Segment], shots: list[Shot], title: str, s: Settings, ca
                                             visual=d.get("visual", ""), entities=d.get("entities", []),
                                             youtube_queries=d.get("youtube_queries", []),
                                             stock_queries=d.get("stock_queries", []),
-                                            avoid=d.get("avoid", []), generic=bool(d.get("generic", False)))
+                                            avoid=d.get("avoid", []), generic=bool(d.get("generic", False)),
+                                            visual_kind=str(d.get("visual_kind") or "footage").strip().lower(),
+                                            graphic=str(d.get("graphic") or "").strip().lower())
             if s.plan_critic:
                 n = _critic(gem, batch, briefs, topic, key)
                 if n:
@@ -470,6 +565,9 @@ def plan(segments: list[Segment], shots: list[Shot], title: str, s: Settings, ca
             briefs[sh.id] = b.model_copy(update={"subject": primary_subject(b) or topic})
     for sh in shots:
         briefs[sh.id] = with_setting(briefs[sh.id], topic, sh.text)
+    kinds = classify_visual(shots, briefs)
+    if kinds:
+        log.info("visual kind set by rule: %s", "; ".join(kinds[:12]))
     return briefs
 
 

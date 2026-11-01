@@ -15,6 +15,23 @@ def kind(provider: str) -> str:
     return "still" if provider.startswith("still_") else "youtube" if provider == "youtube" else "stock" if provider else ""
 
 
+def substitutions(rows: list[dict]) -> dict:
+    """Shots that do not show the exact subject as video, by kind, so no substitution is silent: a photo, a category clip
+    (CATEGORY FALLBACK), reused footage, or a weak match."""
+    out: dict[str, list[int]] = {"photo": [], "category": [], "reuse": [], "weak": []}
+    for r in rows:
+        notes = r.get("notes") or ""
+        if r["status"] == "weak":
+            out["weak"].append(r["shot"])
+        elif "CATEGORY FALLBACK:" in notes:
+            out["category"].append(r["shot"])
+        elif "REUSED footage" in notes:
+            out["reuse"].append(r["shot"])
+        elif str(r.get("provider", "")).startswith("still_"):
+            out["photo"].append(r["shot"])
+    return out
+
+
 def shares(rows: list[dict], shots: list[Shot]) -> dict:
     """Share of the video's running time per kind of visual (youtube / stock / still), in percent."""
     secs: Counter = Counter()
@@ -69,7 +86,7 @@ def build(proj: Project, title: str, shots: list[Shot], qa: QAResult | None, blo
     prov = Counter(r["provider"] for r in rows if r["provider"])
     clips = reused(rows)
     data = {"title": title, "shots": rows, "provider_counts": dict(prov), "shares": shares(rows, shots),
-            "reused_clips": clips, "reuse_problems": reuse_problems(clips, shots),
+            "reused_clips": clips, "reuse_problems": reuse_problems(clips, shots), "substitutions": substitutions(rows),
             "qa": {"passed": qa.passed, "issues": qa.issues, "info": qa.info} if qa else None, "blockers": blockers}
     atomic_write(proj.path("report.json"), json.dumps(data, indent=2, default=str))
 
@@ -95,7 +112,7 @@ def build(proj: Project, title: str, shots: list[Shot], qa: QAResult | None, blo
     page = f"""<!doctype html><meta charset=utf-8><title>{e(title)} report</title>
 <style>body{{font:14px system-ui;margin:24px}}table{{border-collapse:collapse;width:100%}}td,th{{border:1px solid #ccc;padding:4px 8px;vertical-align:top}}
 tr.weak{{background:#fff3cd}}tr.MISSING{{background:#f8d7da}}small{{color:#666}}</style>
-<h1>{e(title)}</h1><p>QA: <b>{'PASSED' if qa and qa.passed else 'ISSUES'}</b> &middot; sources: {dict(prov)} &middot; shares: {data['shares']} &middot; clips used twice: {len(data['reused_clips'])} &middot; credits to add to the description: {len(credits)}</p>
+<h1>{e(title)}</h1><p>QA: <b>{'PASSED' if qa and qa.passed else 'ISSUES'}</b> &middot; sources: {dict(prov)} &middot; shares: {data['shares']} &middot; clips used twice: {len(data['reused_clips'])} &middot; substitutions: {e(str({k: v for k, v in data['substitutions'].items() if v}))} &middot; credits to add to the description: {len(credits)}</p>
 <h3>Blockers</h3><ul>{blk}</ul><h3>QA notes</h3><ul>{issues}</ul>
 <img src="output/contact_sheet.jpg" style="max-width:100%">
 <table><tr><th>#</th><th>Timeline</th><th>Narration</th><th>Provider</th><th>Source</th><th>Score</th><th>Licence</th><th>Status</th></tr>{body}</table>"""
