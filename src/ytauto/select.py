@@ -895,7 +895,9 @@ class Selector(LastResort):
         while best:
             # The most RELEVANT soft-failure, then the best overall: ranking on the total alone picked a lovely
             # mountain road (relevance 0, quality 95) for a sentence about a pistol on the 5 Guns film
-            top = max(best, key=lambda x: (x.score.relevance, x.score.total) if x.score else (0, 0))
+            # A clip the judge actually rated always beats one that only carries a placeholder relevance (never judged:
+            # it failed a free local check); among the same kind, relevance then total.
+            top = max(best, key=lambda x: (x.score.relevance_judged, x.score.relevance, x.score.total) if x.score else (False, 0, 0))
             if self._ai_flagged(shot, top):
                 best.remove(top)
                 continue
@@ -914,7 +916,8 @@ class Selector(LastResort):
         b = shot.brief
         if not (self.s.visual_ladder and self.s.category_fallback and self.gem and b is not None) or b.generic or b.category_of:
             return None
-        top = max((x.score.relevance for x in best if x.score), default=0.0)
+        # judged clips only: an unjudged clip's relevance is a placeholder (stock 62) and must not switch this step off
+        top = max((x.score.relevance for x in best if x.score and x.score.relevance_judged), default=0.0)
         if top >= self.s.category_trigger_relevance:
             return None
         nb = generalise_brief(self.gem, shot)

@@ -99,6 +99,10 @@ class ClipScore(BaseModel):
     cleanliness: float = 0
     narrative: float = 0
     total: float = 0
+    # True only when the AI judge gave a verdict for this clip. A clip that failed a free local check never reaches the judge and
+    # carries a PLACEHOLDER relevance (stock: 62, YouTube: 40 + 0.6 * text score) that must never be ranked against, or counted as,
+    # a judged one (video Great Basin: a placeholder 62 beat a judged 55 and switched the category step off).
+    relevance_judged: bool = False
 
 
 class Decision(BaseModel):

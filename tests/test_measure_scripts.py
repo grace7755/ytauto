@@ -94,3 +94,25 @@ def test_photo_coverage_counts_a_hit_as_exact_only_when_it_names_the_subjects_mo
     assert m.is_exact("AK12 rifle", {"subject": "AK-12"}) is False, "a different spelling is a miss, not a guess"
     assert not m.is_exact("", ak) and not m.is_exact("anything", {"subject": "rifle"}), "no distinctive word, nothing to match"
     assert m.is_exact("Lobaev SVL on a bench", {"subject": "Lobaev SVL rifle"})
+
+
+def test_measure_attempts_tells_placeholder_relevance_from_judged_and_groups_reasons():
+    m = _load("measure_attempts")
+    judged = {"score": {"relevance": 55, "relevance_judged": True}}
+    assert not m.is_placeholder({"score": {"relevance": 62, "relevance_judged": True}})
+    assert m.is_placeholder({"score": {"relevance": 62, "relevance_judged": False}})
+    assert m.is_placeholder({"score": {"relevance": 62}, "notes": "blur=3 | not sent to the judge: failed a local check"})
+    assert not m.is_placeholder({**judged, "notes": "fine"})
+    assert m.reason_key("relevance 59 < 60") == m.reason_key("relevance 41 < 60")
+    assert m.reason_key("watermark / channel logo (AI)") == "watermark / channel logo"
+
+
+def test_measure_attempts_title_overlap_gate_counts_skips_and_lost_accepts():
+    m = _load("measure_attempts")
+    shots = {1: {"brief": {"subject": "Lehman Caves tour", "entities": ["Great Basin"], "setting": "Nevada"}}}
+    rows = [{"shot": 1, "provider": "pexels", "status": "rejected", "title": "traffic in Los Angeles"},
+            {"shot": 1, "provider": "pexels", "status": "accepted", "title": "inside the caves at night"},
+            {"shot": 1, "provider": "coverr", "status": "accepted", "title": "a quiet street"},
+            {"shot": 1, "provider": "pixabay", "status": "rejected", "title": ""},
+            {"shot": 1, "provider": "youtube", "status": "rejected", "title": "not stock"}]
+    assert m.overlap_gate(rows, shots) == (4, 2, 1), "LA traffic and the street skip; an untitled item is never skipped"

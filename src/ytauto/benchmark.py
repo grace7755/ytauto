@@ -73,6 +73,7 @@ def evaluate(s: Settings, c: Candidate, info: MediaInfo | None, chk: CheckResult
     if verdict:
         # the AI judge overrides the heuristic components it can actually see
         sc.relevance = float(verdict["relevance"])
+        sc.relevance_judged = True
         sc.authenticity = float(verdict["authenticity"])
         sc.composition = float(verdict["composition"])
         sc.narrative = float(verdict["narrative"])

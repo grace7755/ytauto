@@ -117,8 +117,8 @@ class Settings(BaseModel):
     # Round 6 visual ladder (Selector.select). false = the exact old shot order.
     visual_ladder: bool = True
     # judged attempts (YouTube + stock, screen-only rejects excluded) per shot before it moves on to a photo / category /
-    # reuse. video-4 replay: median 6 judged attempts per shot, max 22 (a cap of 16 saved only 3%); the shots it stops get the later steps. 0 = off
-    shot_attempts_budget: int = 12
+    # reuse. video-4: median 6 judged attempts per shot, max 22. Great Basin (46 shots): median 2, 5 shots without a clip used 40% of all attempts; a cap of 6 saves 33%, of 8 25%, of 12 11%, and 3 of 41 accepted clips would come from the later steps instead. The shots it stops get the later steps. 0 = off
+    shot_attempts_budget: int = 6
     # query relaxation: when the exact subject found nothing close (best relevance below the trigger), rewrite the brief once
     # to its category (planner.generalise_brief) and try a short search; the clip is marked CATEGORY FALLBACK
     category_fallback: bool = True

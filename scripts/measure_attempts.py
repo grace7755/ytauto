@@ -7,6 +7,11 @@ Replays one project's `ledger.jsonl` (no network, no AI calls) and prints:
      (an accepted row that would have been skipped is a real loss - it must stay near 0)
   4. per-shot attempt counts, the attempt index at which shots got their accepted clip, and what an attempt cap
      of N per shot (fix A3) would have saved and lost
+  5. judged vs PLACEHOLDER relevance: a clip that failed a free local check never reaches the judge and carries a made-up
+     relevance (stock: 62); how many rows, and how many with placeholder >= 50 (they used to switch the category step off)
+  6. rejected rows the judge rated >= 60 grouped by hard-reject reason: why good footage was thrown away
+  7. a title-overlap gate for stock and stills (skip an item whose title shares no word with the shot's subject, entities or
+     setting): how many attempts it would skip and how many accepted clips it would lose
 
     .venv\Scripts\python scripts\measure_attempts.py projects\<slug> [--before 2026-11-01T16:10:00]
 
@@ -60,6 +65,44 @@ def relevance(r: dict) -> float | None:
 def subject_words(shot: dict | None) -> set[str]:
     b = (shot or {}).get("brief") or {}
     return tokens(" ".join([b.get("subject") or "", " ".join(b.get("entities") or [])]))
+
+
+def place_words(shot: dict | None) -> set[str]:
+    """Subject, entities and setting: what a title must share a word with for the title-overlap gate."""
+    b = (shot or {}).get("brief") or {}
+    return subject_words(shot) | tokens(b.get("setting") or "")
+
+
+def is_placeholder(r: dict) -> bool:
+    """True when the row's relevance was never judged: new ledgers say so (`relevance_judged` false); older ones only carry
+    the note written when a local check kept the clip from the judge."""
+    sc = r.get("score") or {}
+    if "relevance_judged" in sc:
+        return not sc["relevance_judged"]
+    return "not sent to the judge" in (r.get("notes") or "")
+
+
+_NUMS = re.compile(r"[\d.]+")
+
+
+def reason_key(reject: str) -> str:
+    """A hard-reject text without its numbers or the part in brackets, so equal reasons group."""
+    return _NUMS.sub("#", re.sub(r"\(.*?\)", "", reject)).strip()
+
+
+def overlap_gate(judged: list[dict], shots: dict[int, dict]) -> tuple[int, int, int]:
+    """(stock/still attempts, skipped by the title-overlap gate, accepted clips among the skipped). An item with no title is
+    never skipped (nothing is known)."""
+    total = skipped = lost = 0
+    for r in judged:
+        if r["provider"] not in STOCK:
+            continue
+        total += 1
+        title = tokens(r.get("title", ""))
+        if title and not (title & place_words(shots.get(r["shot"]))):
+            skipped += 1
+            lost += r["status"] == "accepted"
+    return total, skipped, lost
 
 
 def main():
@@ -141,6 +184,33 @@ def main():
         saved = sum(max(0, len(v) - n) for v in by_shot.values())
         lost_n = sum(1 for i in hit if i > n)
         print(f"     {n:3}: saved {saved:5} of {len(judged)} ({100 * saved / len(judged):4.1f}%)   lost {lost_n}")
+
+    # 5. placeholder relevance
+    print("\n5. judged vs placeholder relevance (placeholder = never sent to the judge: it failed a free local check)")
+    scored = [r for r in judged if r.get("score")]
+    ph = [r for r in scored if is_placeholder(r)]
+    print(f"   rows with a score: {len(scored)}   placeholder: {len(ph)}   judged: {len(scored) - len(ph)}")
+    high = [r for r in ph if (relevance(r) or 0) >= 50]
+    print(f"   placeholder relevance >= 50 (the old category trigger counted these as 'something close'): {len(high)}"
+          f" on {len({r['shot'] for r in high})} shots")
+
+    # 6. high-relevance rejects
+    print("\n6. rejected rows the judge rated >= 60, by hard-reject reason")
+    why: Counter = Counter()
+    n_high = 0
+    for r in judged:
+        if r["status"] == "rejected" and not is_placeholder(r) and (relevance(r) or 0) >= 60:
+            n_high += 1
+            for h in r.get("hard_rejects") or ["(no reason logged)"]:
+                why[reason_key(str(h))] += 1
+    print(f"   {n_high} rows")
+    for k, n in why.most_common(10):
+        print(f"   {n:4}  {k}")
+
+    # 7. title-overlap gate
+    total, skipped, lost = overlap_gate(judged, shots)
+    print("\n7. title-overlap gate for stock/stills (skip when the title shares no word with subject, entities or setting)")
+    print(f"   would skip {skipped} of {total} stock/still attempts; accepted clips among them: {lost}")
 
 
 if __name__ == "__main__":

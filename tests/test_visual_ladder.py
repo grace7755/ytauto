@@ -165,7 +165,7 @@ def test_a_found_photo_ends_the_ladder(tmp_path):
 # --- the category step ----------------------------------------------------------------------------------
 def _weak(rel):
     return Decision(shot=0, status="rejected", provider="youtube", source_id="v", url="u",
-                    score=ClipScore(relevance=rel, total=50))
+                    score=ClipScore(relevance=rel, total=50, relevance_judged=True))
 
 
 def _cat_case(tmp_path, monkeypatch, **kw):
@@ -427,3 +427,59 @@ def test_a_failed_request_is_not_cached(commons):
     responses.append(_Resp(500))
     assert c.search("a", 4) == []
     assert [x.source_id for x in c.search("a", 4)] == ["1"] and len(calls) == 2
+
+
+# --- placeholder relevance (Great Basin: a made-up 62 beat a judged 55 and switched the category step off) -------------
+def _dec(tmp_path, name, rel, judged, total=50.0, shot=0):
+    clip = tmp_path / f"{name}.mp4"
+    clip.write_bytes(b"x")
+    return Decision(shot=shot, status="rejected", provider="youtube" if judged else "coverr", source_id=name, url="u",
+                    clip_path=str(clip), score=ClipScore(relevance=rel, total=total, relevance_judged=judged))
+
+
+def test_evaluate_marks_a_relevance_as_judged_only_when_the_judge_answered():
+    from ytauto.benchmark import evaluate
+    from ytauto.inspect.checks import CheckResult
+    from ytauto.inspect.probe import MediaInfo
+    info = MediaInfo(width=1920, height=1080, duration=5, fps=30, has_audio=False, codec="h")
+    chk = CheckResult(blur=200, saturation=0.4, n_frames=3)
+    c = Candidate(provider="coverr", source_id="1", url="u")
+    assert evaluate(Settings(), c, info, chk, None, 62.0)[0].relevance_judged is False
+    v = {"relevance": 55, "authenticity": 80, "composition": 70, "narrative": 60, "quality": 80, "cleanliness": 90, "recency": 70}
+    sc = evaluate(Settings(), c, info, chk, v, 62.0)[0]
+    assert sc.relevance_judged is True and sc.relevance == 55
+
+
+def _weak_case(tmp_path, decisions):
+    sh = _shot(0)
+    sel, proj = _sel(tmp_path, [sh], gem=object())
+    order = []
+    _record(sel, order, *ALL_STEPS)
+    sel._youtube = lambda shot, best, rounds=None, cap=None: best.extend(decisions)
+    sel._ai_flagged = lambda shot, d: False
+    return sh, sel
+
+
+def test_a_judged_weak_candidate_beats_an_unjudged_one_with_a_higher_placeholder(tmp_path):
+    cafe = _dec(tmp_path, "cafe", 62, False, total=60)
+    cave = _dec(tmp_path, "cave", 55, True, total=50)
+    sh, sel = _weak_case(tmp_path, [cafe, cave])
+    got = sel.select(sh)
+    assert got.status == "weak" and got.source_id == "cave", "the clip the judge rated 55 beats a made-up 62"
+
+
+def test_an_unjudged_candidate_is_still_used_when_nothing_was_judged(tmp_path):
+    a = _dec(tmp_path, "a", 62, False, total=60)
+    b = _dec(tmp_path, "b", 40, False, total=70)
+    sh, sel = _weak_case(tmp_path, [a, b])
+    assert sel.select(sh).source_id == "a", "all unjudged: relevance then total, as before"
+
+
+def test_the_category_step_ignores_placeholder_relevance(tmp_path, monkeypatch):
+    sh, sel, _, seen = _cat_case(tmp_path, monkeypatch)
+    cafe = _dec(tmp_path, "cafe", 62, False)
+    sel._category(sh, [cafe])
+    assert seen, "only an unjudged 62 turned up: nothing close was found, so the category is searched"
+    seen.clear()
+    sel._category(sh, [cafe, _dec(tmp_path, "cave", 55, True)])
+    assert seen == [], "a judged near miss (55) still wins as a weak match"
